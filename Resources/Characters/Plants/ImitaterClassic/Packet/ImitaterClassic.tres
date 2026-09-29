@@ -1,0 +1,19 @@
+[gd_resource type="Resource" script_class="TowerDefensePacketConfig" format=3]
+
+[ext_resource type="Resource" path="../Config/TowerDefensePlantImitaterClassic.tres" id="1"]
+[ext_resource type="Script" path="res://Registry/Battle/Feature/PacketBank/Resource/Packet/TowerDefensePacketConfig.cs" id="2"]
+
+[resource]
+script = ExtResource("2")
+saveKey = "ImitaterClassic"
+unlockCheckList = []
+name = "经典模仿者"
+describe = "选中后自动复制你上一次选择的那张植物卡：卡面、阳光与冷却都按那张卡结算；种下后长出那张植物并播放模仿者变身特效，卡片随即还原，可继续复制下一张。"
+handbookDescribe = "PvZ 1 代原版行为：模仿者本身没有固定形态。\n· 选中它时，自动变成你【上一次选择】的那张植物卡；\n· 阳光与冷却都按被复制的那张卡结算；\n· 种下后直接长出那张植物，卡片随后还原成模仿者本体，可继续复制下一张；\n· 还没有任何已选植物时，这张卡不可选（置灰）；\n· 若这张卡由随机取卡类玩法给出（此时不存在『上一次选择』），种下时会随机变成一张彩卡植物；\n· 待选区的模仿者卡始终保持模仿者外观；取消被模仿的植物时，卡槽里的模仿者卡会一并取消。"
+handbookStory = "它什么都不是，直到你告诉它该成为什么。"
+packetAnimeClip = "Idle"
+packetAnimeOffset = Vector2(21, 25)
+packetAnimeScale = Vector2(0.5, 0.5)
+characterConfig = ExtResource("1")
+type = 3
+metadata/_custom_type_script = "res://Registry/Battle/Feature/PacketBank/Resource/Packet/TowerDefensePacketConfig.cs"

@@ -1,0 +1,20 @@
+[gd_resource type="Resource" script_class="TowerDefensePlantConfig" format=3]
+
+[ext_resource type="Script" path="res://Resource/TowerDefense/Character/Config/TowerDefensePlantConfig.cs" id="1"]
+
+[resource]
+script = ExtResource("1")
+name = "ImitaterClassic"
+canCopy = false
+damagePointData = null
+armorData = null
+customData = null
+ashScene = null
+homeWorld = 1
+costRise = 0
+cost = 0
+packetCooldown = 30.0
+plantGridType = [-1]
+collisionFlags = 11
+maskFlags = 9
+metadata/_custom_type_script = "res://Resource/TowerDefense/Character/Config/TowerDefensePlantConfig.cs"

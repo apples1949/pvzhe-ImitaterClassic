@@ -1,0 +1,10 @@
+C:\Users\txgcs\WorkBuddy\zjb\mod\ImitaterClassic\runtime_src\obj\Release\ImitaterClassic.csproj.AssemblyReference.cache
+C:\Users\txgcs\WorkBuddy\zjb\mod\ImitaterClassic\runtime_src\obj\Release\ImitaterClassic.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\txgcs\WorkBuddy\zjb\mod\ImitaterClassic\runtime_src\obj\Release\ImitaterClassic.AssemblyInfoInputs.cache
+C:\Users\txgcs\WorkBuddy\zjb\mod\ImitaterClassic\runtime_src\obj\Release\ImitaterClassic.AssemblyInfo.cs
+C:\Users\txgcs\WorkBuddy\zjb\mod\ImitaterClassic\runtime_src\obj\Release\ImitaterClassic.csproj.CoreCompileInputs.cache
+C:\Users\txgcs\WorkBuddy\zjb\mod\ImitaterClassic\runtime_src\bin\Release\JTYImitaterClassic.deps.json
+C:\Users\txgcs\WorkBuddy\zjb\mod\ImitaterClassic\runtime_src\bin\Release\JTYImitaterClassic.dll
+C:\Users\txgcs\WorkBuddy\zjb\mod\ImitaterClassic\runtime_src\obj\Release\JTYImitaterClassic.dll
+C:\Users\txgcs\WorkBuddy\zjb\mod\ImitaterClassic\runtime_src\obj\Release\refint\JTYImitaterClassic.dll
+C:\Users\txgcs\WorkBuddy\zjb\mod\ImitaterClassic\runtime_src\obj\Release\ref\JTYImitaterClassic.dll

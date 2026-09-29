@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 2,
+  "id": "imitaterclassic",
+  "name": "经典模仿者",
+  "version": "1.3.3",
+  "author": "本地",
+  "description": "新增植物「经典模仿者」（彩卡）：PvZ 1 代原版模仿者行为 —— 选中该卡后自动复制你上一次选择的植物种子包，按那张卡的花费与冷却种下，种完自动还原。若该卡由随机取卡类玩法给出（无\"上一次选择\"），则随机变成一张彩卡植物。（含托管运行时插件 Runtime/ModAssembly.dll）",
+  "dependencies": [],
+  "conflicts": [],
+  "provides": {
+    "Character": [
+      "ImitaterClassic"
+    ],
+    "CharacterSprite": [
+      "ImitaterClassic"
+    ],
+    "Packet": [
+      "ImitaterClassic"
+    ]
+  },
+  "overrides": {},
+  "scripts": [],
+  "runtimeAssembly": "Runtime/ModAssembly.dll",
+  "runtimeEntryType": "ImitaterClassicEntry",
+  "runtimeApiVersion": 1,
+  "runtimeAssemblyPolicy": "optional",
+  "blueprints": [],
+  "translations": [],
+  "resources": [
+    "Resources/Cards/ImitaterClassic.tres",
+    "Resources/Characters/Plants/ImitaterClassic/Config/TowerDefensePlantImitaterClassic.tres",
+    "Resources/Characters/Plants/ImitaterClassic/Packet/ImitaterClassic.tres",
+    "Resources/Characters/Plants/ImitaterClassic/Scene/ImitaterClassic.tscn",
+    "Resources/Characters/Plants/ImitaterClassic/Scene/ImitaterClassicComponentSet.tres",
+    "Resources/Characters/Plants/ImitaterClassic/Sprite/ImitaterClassic.tscn",
+    "Runtime/ModAssembly.dll"
+  ]
+}
