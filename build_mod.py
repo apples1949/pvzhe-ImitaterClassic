@@ -115,7 +115,7 @@ armorData = null
 customData = null
 ashScene = null
 homeWorld = 1
-costRise = 0
+costRise = -1
 cost = 0
 packetCooldown = 30.0
 plantGridType = [-1]
@@ -245,7 +245,7 @@ def manifest():
         "schemaVersion": 2,
         "id": MOD_ID,
         "name": MOD_NAME,
-        "version": "1.3.3",
+        "version": "1.5.0",
         "author": "本地",
         "description": (
             f"新增植物「{PN}」（彩卡）：PvZ 1 代原版模仿者行为 —— 选中该卡后自动复制你"

@@ -72,6 +72,22 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 	/// <summary>内置模仿者变身特效（`TowerDefensePlantImitater.Explode()` 用的那个）。</summary>
 	private const string ImitaterCloudUid = "uid://djvfnrjg7vtqn";
 
+	/// <summary>内置模仿者的**精灵场景**（要补播的变身动画就在它上面）。</summary>
+	private const string ImitaterSpritePath =
+		"res://Asset/Anime/Character/Plant/Chapter0/Imitater/Imitater.tscn";
+
+	/// <summary>
+	/// ★ v1.3.5：内置 `TowerDefensePlantImitaterExplodeDefinition.tres` 的
+	/// `explodeAnimeClips = "Explode"` + `explodeAnimeTimeScale = 0.5`
+	/// （`ExplodeComponent` 进入爆炸态时 `sprite.SetAnimation("Explode", loop:false, 0.2)`）。
+	/// 精灵上有 `Imitater_spin` 图层 —— 那段"旋转变身"就是它。
+	/// </summary>
+	private const string ImitaterExplodeClip = "Explode";
+	private const double ImitaterExplodeTimeScale = 0.5;
+
+	/// <summary>变身动画兜底回收时间（秒）——万一 `OnAnimeCompleted` 没回调也不留残影。</summary>
+	private const double ImitaterTransformFallbackSec = 2.2;
+
 	/// <summary>诊断日志开关（走 GD.Print 直出，不受 Mod 日志总开关影响）。</summary>
 	private static readonly bool EnableLog = false;
 
@@ -95,10 +111,29 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 	private bool _started;
 	private bool _bankTried;
 	private bool _bankOk;
-	private ulong _cloudSceneId;
 
 	/// <summary>"上一次选择的非模仿者植物"（口径见类头注释）。</summary>
 	private TowerDefensePacketConfig _lastPlant;
+
+	/// <summary>
+	/// ★★ v1.5.0：**卡槽里每一张模仿者卡各自要跟随哪一张植物**（键 = 卡实例 ID）。
+	///
+	/// 依据（原版 PvZ1 语义）：模仿者复制的是**它前面那一张卡**。用户的自制关卡
+	/// 用「预选卡模式」把卡组写成实卡/模仿者交替：
+	///     热狗 · 模仿者 · 豌豆炮 · 模仿者 · 加农炮 · 模仿者 · 冰炮 · 模仿者 · 末日炮 · 模仿者
+	/// 若全部按"最后一次选择"跟随，5 张模仿者会**全变成同一张**（列表里最后一张实卡）
+	/// ⇒ 交替设计的意图完全看不出来（用户反馈"选择了多个模仿者 会有显示异常"）。
+	/// 该表每帧在 <see cref="DriveSeedBank"/> 里重建。
+	/// </summary>
+	private readonly System.Collections.Generic.Dictionary<ulong, TowerDefensePacketConfig> _bankTargets
+		= new System.Collections.Generic.Dictionary<ulong, TowerDefensePacketConfig>();
+
+	/// <summary>
+	/// 变身目标**锁存**：玩家拿起某张模仿者卡时按它的左邻锁定，放下后**仍保持**。
+	/// 原因：`TowerDefensePlantImitater.Explode()` 在种下之后（旋转动画播完）才跑，
+	/// 那时手上已经没有卡了；只有锁存才能保证"种哪张变哪张"。
+	/// </summary>
+	private TowerDefensePacketConfig _latchedTarget;
 
 	/// <summary>诊断计数（只打前若干条）。</summary>
 	private int _diag;
@@ -179,6 +214,7 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 			}
 			ResetOnLevelChange();
 			EnsureCardPlacement();
+			EnsureEditorBank();
 
 			TowerDefenseManager mgr = TowerDefenseManager.Instance;
 			if (mgr == null || !GodotObject.IsInstanceValid(mgr))
@@ -187,9 +223,10 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 			}
 			TowerDefenseInGameSeedBank seedBank = mgr.GetSeedBank();
 
-			ResolveLastPlant(seedBank);      // ① 先定"最后一次选择"
-			DriveSeedBank(seedBank);         // ② 卡槽里的模仿者卡跟随 ①
-			EnforceImitaterSelectable();     // ③ 没有 ① 时卡池的模仿者卡置灰
+			ResolveLastPlant(seedBank);        // ① 全局兜底目标
+			DriveSeedBank(seedBank);           // ② 卡槽：**逐张各自跟随左邻实卡**（内部建 _bankTargets）
+			PointColourBankAtHeld();           // ②b 变身目标 = 当前拿起那张模仿者的目标（锁存）
+			EnforceImitaterSelectable();       // ③ 没有 ① 时卡池的模仿者卡置灰
 		}
 		catch (Exception ex)
 		{
@@ -341,11 +378,10 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 				return;
 			}
 
-			// ── (1) 前置阶段：移出"被模仿植物已不在卡槽"的模仿者卡（需求 2b）─────
+			// ── (1) 前置阶段：被模仿植物已不在卡槽 ⇒ 模仿者卡一并移出（需求 2b）──
+			//   ★ v1.4.0：判断"这张模仿者卡当前显示成哪张植物"改看 `_slotShown`
+			//   （不再看 `config.saveKey` —— 现在不改 config 了，见 ReskinCard 说明）。
 			//   必须独立成一遍：`DeletePacket()` 会改 `packetList`，不能在遍历中调用。
-			//   ★ 只在**选卡阶段**做 —— 战斗期卡槽固定、没有"取消选择"，
-			//     而且战斗期若那张被模仿植物因 `plantOnce` 被释放（节点失效但仍在
-			//     `packetList` 里），`ExistsInBank` 会误判成"不在"⇒ 误删模仿者卡。
 			if (seedBank.hasGameStarted != true)
 			{
 				var toDelete = new System.Collections.Generic.List<TowerDefenseInGamePacketShow>();
@@ -355,16 +391,16 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 					{
 						continue;
 					}
-					TowerDefensePacketConfig cfg = SafeConfig(card);
-					if (cfg == null || cfg.saveKey == MyKey)
-					{
-						continue;                       // 本体态 / 无 config ⇒ 不删
-					}
 					if (card.originalSaveKey != MyKey)
 					{
 						continue;                       // 不是我们的模仿者卡
 					}
-					if (ExistsInBank(seedBank, cfg.saveKey, card))
+					if (!_slotShown.TryGetValue(card.GetInstanceId(), out string shown)
+						|| string.IsNullOrEmpty(shown) || shown == MyKey)
+					{
+						continue;                       // 显示的是模仿者本体 ⇒ 不管
+					}
+					if (ExistsInBank(seedBank, shown, card))
 					{
 						continue;                       // 被模仿植物还在卡槽 ⇒ 保留
 					}
@@ -376,31 +412,18 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 					{
 						continue;
 					}
-					TowerDefensePacketConfig cfg = SafeConfig(card);
-					Log("被模仿的 " + (cfg != null ? cfg.saveKey : "?") + " 已被取消 ⇒ 模仿者卡一并移出卡槽。");
+					Log("被模仿的 " + _slotShown[card.GetInstanceId()] + " 已被取消 ⇒ 模仿者卡一并移出卡槽。");
 					_slotShown.Remove(card.GetInstanceId());
+					_slotSprite.Remove(card.GetInstanceId());
 					seedBank.DeletePacket(card);
 				}
 			}
 
-			// ── (2) ★★ v1.2.1 关键修复：**每帧按"身份键"重建 `packetNameSet`**────
-			//
-			//   `TowerDefenseInGameSeedBank.packetNameSet` 是"卡槽里有哪些卡"的集合，
-			//   键 = `config.saveKey`。而游戏自己判定"卡的身份"用的是 **`originalSaveKey`
-			//   （非空时）否则 `config.saveKey`**（见 `FindSelectedPacket()` /
-			//   `DeletePacket()` / `EmitChooseOverAsync()`）。
-			//
-			//   我们 `Cover()` 会把卡槽模仿者卡的 `config.saveKey` 改成被模仿植物
-			//   ⇒ `AddPacket()` 放进去的 `"ImitaterClassic"` 在 `DeletePacket()` 里
-			//     **永远不会被移除**（它 Remove 的是 `"PlantFirenut"` 之类的键）
-			//   ⇒ `HasPacket("ImitaterClassic")` 从此恒为 true
-			//   ⇒ `BindVirtualizedPacket()` 里 `alive = !HasPacket(saveKey)` 恒 false
-			//   ⇒ `PacketChoose()` 的加卡分支 `if (!packet.alive ...) { Reset(); return; }`
-			//     **拒绝再把模仿者加进卡槽** ⇒ 用户看到"无法模仿 c / 无法模仿 d"。
-			//
-			//   ⇒ 按身份键重建，让 `HasPacket()` 与 `FindSelectedPacket()` 口径一致。
+			// ── (2) ★★ v1.2.1 关键修复：按"身份键"重建 `packetNameSet` ──
+			//   （`Cover()` 已不再使用，但这条校准仍然必要：它保证 `HasPacket()` 与
+			//     `FindSelectedPacket()` 口径一致 —— 详见 v1.2.1 注释。）
 			Godot.Collections.Dictionary pns = seedBank.packetNameSet;
-			if (pns != null)   // ★ Dictionary 不是 GodotObject，不能走 IsInstanceValid
+			if (pns != null)
 			{
 				pns.Clear();
 				foreach (TowerDefenseInGamePacketShow c0 in seedBank.packetList)
@@ -419,11 +442,7 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 				}
 			}
 
-			// ── (3) 清理 `_slotShown` 里已不在卡槽的条目 ─────────────────────────
-			//   卡槽卡走**对象池**（`ReturnPacketToPool` → `ResetForPool`），
-			//   同一个节点会被复用；若不清理，"上一张显示成 X"的旧记录会让
-			//   "刚种下成功"的检测误触发（日志里那条
-			//   `已补播模仿者变身特效（格子 -1,-1）` 就是这么来的）。
+			// ── (3) 清理已不在卡槽的记录（卡走对象池，节点会被复用）──
 			if (_slotShown.Count > 0)
 			{
 				var gone = new System.Collections.Generic.List<ulong>();
@@ -446,73 +465,70 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 				foreach (ulong k in gone)
 				{
 					_slotShown.Remove(k);
+					_slotSprite.Remove(k);
 				}
 			}
 
-			// ── (4) 主循环：让模仿者卡跟随 `_lastPlant` ───────────────────────────
+			// ── (4a) ★★ v1.5.0：**逐张解析"各自跟随哪一张"** ──────────────
+			//   规则（原版 PvZ1 语义）：一张模仿者卡跟随**它前面最近的那张植物卡**。
+			//   取不到（模仿者排在第一位 / 前面没有实卡）才回退到全局 `_lastPlant`。
+			//   依据：`seedBank.packetList` 就是"卡槽里的卡的顺序" ——
+			//     · 选卡模式：按玩家选择的先后追加；
+			//     · 预选卡模式（PRESET）：`TowerDefenseBattleFeaturePacketBank.PacketBankInit()`
+			//       按关卡 `config.packetList` 的顺序逐张 `seedBank.AddPacket()` 追加。
+			_bankTargets.Clear();
+			TowerDefensePacketConfig prevPlant = null;
+			foreach (TowerDefenseInGamePacketShow c2 in seedBank.packetList)
+			{
+				if (c2 == null || !GodotObject.IsInstanceValid(c2))
+				{
+					continue;
+				}
+				if (c2.originalSaveKey == MyKey)
+				{
+					_bankTargets[c2.GetInstanceId()] = prevPlant;   // 左邻实卡；没有 ⇒ null
+					continue;
+				}
+				TowerDefensePacketConfig cf2 = SafeConfig(c2);
+				if (cf2 != null && cf2.saveKey != MyKey && cf2.characterConfig is TowerDefensePlantConfig)
+				{
+					prevPlant = cf2;         // 越靠后越新
+				}
+			}
+
+			// ── (4b) 主循环：每张模仿者卡按**它自己的目标**换卡面 ────────
 			foreach (TowerDefenseInGamePacketShow card in seedBank.packetList)
 			{
 				if (card == null || !GodotObject.IsInstanceValid(card))
 				{
 					continue;
 				}
-				TowerDefensePacketConfig cfg = SafeConfig(card);
-				if (cfg == null)
+				if (card.originalSaveKey != MyKey)
 				{
-					continue;
+					continue;                 // 只管我们的模仿者卡
 				}
-				bool mine = cfg.saveKey == MyKey || card.originalSaveKey == MyKey;
-				if (!mine)
-				{
-					continue;
-				}
-
+				TowerDefensePacketConfig want = TargetOfCard(card);
+				string desired = (want == null) ? MyKey : want.saveKey;
 				ulong id = card.GetInstanceId();
-				string prevShown;
-				if (!_slotShown.TryGetValue(id, out prevShown))
+				bool needReskin = !_slotShown.TryGetValue(id, out string shown) || shown != desired;
+				if (!needReskin && _slotSprite.TryGetValue(id, out ulong prevSpr))
 				{
-					prevShown = null;
-				}
-				prevShown = prevShown ?? cfg.saveKey;      // 首次见到 ⇒ 以当前状态为准
-
-				if (cfg.saveKey == MyKey)
-				{
-					// 卡片此刻就是模仿者本体（刚加入卡槽，或刚被游戏的 ChangePacket 还原）。
-					string before;
-					_slotShown.TryGetValue(id, out before);    // 首次见到 = null
-					prevShown = MyKey;
-					if (_lastPlant != null && GodotObject.IsInstanceValid(_lastPlant))
+					// 卡面若被游戏自己重建过（精灵对象换了）⇒ 也要重刷一次
+					ulong nowSpr = SpriteIdOf(card);
+					if (nowSpr != 0 && nowSpr != prevSpr)
 					{
-						// ★ "刚刚种下成功"的检测：`Cover(..., changePacket:true)` 塞的
-						//   `CardActionBehaviorChangePacket` 会在**种成功后**把它 `Init` 回模仿者本体。
-						//   ⇒ "上一帧还显示着被模仿植物、这一帧自己变回 MyKey" = 刚种下成功。
-						if (!string.IsNullOrEmpty(before) && before != MyKey)
-						{
-							SpawnImitaterCloud();
-						}
-						ApplyMimic(card, _lastPlant);
-						prevShown = _lastPlant.saveKey;
+						needReskin = true;
 					}
-					_slotShown[id] = prevShown;
-					continue;
 				}
-
-				// ── 卡片此刻显示成某张"被模仿植物"（cfg.saveKey != MyKey）────────
-				if (_lastPlant == null || !GodotObject.IsInstanceValid(_lastPlant))
+				if (needReskin)
 				{
-					RestoreToImitater(card);
-					prevShown = MyKey;
+					ReskinCard(card, want);
+					_slotShown[id] = desired;
+					_slotSprite[id] = SpriteIdOf(card);
+					Log("卡槽模仿者卡面 → " + (want == null ? "模仿者本体" : want.saveKey));
 				}
-				else if (cfg.saveKey != _lastPlant.saveKey)
-				{
-					ApplyMimic(card, _lastPlant);
-					prevShown = _lastPlant.saveKey;
-				}
-				else
-				{
-					prevShown = cfg.saveKey;
-				}
-				_slotShown[id] = prevShown;
+				// ★ v1.4.4：价格每帧跟随（涨价植物 / 关卡改价都能同步）
+				SyncMimicCost(card, want);
 			}
 		}
 		catch (Exception ex)
@@ -525,7 +541,20 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 		}
 	}
 
-	/// <summary>
+	/// <summary>取卡面精灵对象的实例 ID（0 = 没有/拿不到）。</summary>
+	private static ulong SpriteIdOf(TowerDefenseInGamePacketShow card)
+	{
+		try
+		{
+			object sp = GetMember(card, "sprite");
+			return (sp is GodotObject go && GodotObject.IsInstanceValid(go)) ? go.GetInstanceId() : 0UL;
+		}
+		catch
+		{
+			return 0UL;
+		}
+	}
+
 	/// 卡槽里是否存在"身份 = `key`"的**其他**卡（用于判断被模仿植物是否还在卡槽里）。
 	/// 身份口径与游戏一致：`originalSaveKey` 非空用之，否则用 `config.saveKey`。
 	/// </summary>
@@ -561,94 +590,449 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 		return false;
 	}
 
-	/// <summary>卡槽里各模仿者卡"上一次显示成哪张植物"（`saveKey`；用于识别"刚种下成功"）。</summary>
+	/// <summary>卡槽里各模仿者卡"当前显示成哪张植物"（`saveKey`；`MyKey` = 模仿者本体）。</summary>
 	private readonly System.Collections.Generic.Dictionary<ulong, string> _slotShown
 		= new System.Collections.Generic.Dictionary<ulong, string>();
 
+	/// <summary>各模仿者卡上次换面后的精灵对象 ID（用于发现"卡面被游戏重建过"）。</summary>
+	private readonly System.Collections.Generic.Dictionary<ulong, ulong> _slotSprite
+		= new System.Collections.Generic.Dictionary<ulong, ulong>();
+
 	/// <summary>
-	/// 把卡槽里的模仿者卡**换成** `want`（被模仿植物）。
+	/// ★★ v1.4.0 架构调整：**不再用 `Cover()` 改 config**，只换**卡面精灵**。
 	///
-	/// ★ 必须传副本：`Cover()` 会**就地修改**传入的 config
-	///   （`_config._override = overrideVal`），传原对象会污染全局共享配置。
-	/// ★ 副本**必须保留被模仿植物的 `saveKey`** —— 这是"卡面显示成被模仿植物"的前提：
-	///   `TowerDefenseManager.GetPacketSpriteScene()` 优先按 `config.saveKey` 去
-	///   `CHARCTAER_SPRITE` 查精灵。
-	/// ★ `originalSaveKey` 不变（仍是 `ImitaterClassic`）⇒ `FindSelectedPacket()`
-	///   / `DeletePacket()` 依旧把这张卡认作模仿者，卡槽去重、点卡取消都正常。
+	/// ── 为什么必须改 ────────────────────────────────────────────────
+	/// 旧做法 `Cover(copy)` 会把卡槽卡的 `config.saveKey` 换成被模仿植物 ⇒ 种下时
+	/// `Plant()` 创建的是"被模仿植物本体"，**整个绕过模仿者角色** ⇒
+	/// 内置模仿者那段 `"Explode"` 旋转变身动画（`Imitater.tres` 片段 50~80 帧，
+	/// `explodeAnimeTimeScale = 0.5`）**永远不会播**。
+	/// 用户明确要看："我要看到模仿者旋转的动画"。
 	///
-	/// keepColddown:false ⇒ 用被模仿植物自己的冷却；
-	/// changePacket:true ⇒ 种成功后自动还原（要求 3）。
+	/// ── 现在 ────────────────────────────────────────────────────────
+	/// `config` 保持**模仿者本体**（`saveKey` 恒为 `ImitaterClassic`）⇒ 种下创建
+	/// `ImitaterClassic` 角色（= `TowerDefensePlantImitater` 的伴随脚本）⇒
+	/// 游戏自己的 `ExplodeComponent`：
+	///   ① 播 `"Explode"` 片段（旋转，0.5 倍速）
+	///   ② `OnAnimeCompleted` → `InvokeExplodeCallbacks()` → `TowerDefensePlantImitater.Explode()`
+	///      → 放云特效 + 按 `packetBank`（= `ImitaterClassicDiamond`）随机生成植物
+	/// 目标植物由 <see cref="PointColourBankAt"/> 把该卡池收窄成"只有那一张"来决定 ⇒ 结果确定 ✓
+	///
+	/// ── 卡面怎么换 ──────────────────────────────────────────────────
+	/// 临时把 `ResourceManager.CHARCTAER_SPRITE[MyKey]` 指向目标植物的精灵场景，
+	/// 调 `card.CreateSprite()` 重建卡面，**随后立刻还原字典** —— 卡池那张卡（已有自己的精灵）
+	/// 与别处都不受影响。
+	///
+	/// ⚠️ 试过"单独实例化 `Imitater.tscn` 播动画"这条路（v1.3.5）：**不渲染** ——
+	///    `AdobeAnimateSprite` 必须由游戏的渲染管线接管，野路子实例化画不出来。
 	/// </summary>
-	private void ApplyMimic(TowerDefenseInGamePacketShow cur, TowerDefensePacketConfig want)
+	private void ReskinCard(TowerDefenseInGamePacketShow card, TowerDefensePacketConfig want)
 	{
 		try
 		{
-			TowerDefensePacketConfig cfg = SafeConfig(cur);
-			if (cfg == null || want == null || !GodotObject.IsInstanceValid(want))
+			ResourceManager rm = ResourceManager.Instance;
+			if (rm == null || !GodotObject.IsInstanceValid(rm))
 			{
 				return;
 			}
-			if (cfg.saveKey == want.saveKey)
-			{
-				return;      // 已经是目标 ⇒ 幂等
-			}
-			TowerDefensePacketConfig copy = want.Duplicate() as TowerDefensePacketConfig;
-			if (copy == null || !GodotObject.IsInstanceValid(copy))
+			var dict = rm.CHARCTAER_SPRITE;
+			if (dict == null)
 			{
 				return;
 			}
-			copy.@override = null;
-			cur.Cover(copy, null, false, true);
-			// `Cover → Init` 里有 `if (!_previewCreationDeferred) CreateSprite();`；
-			// 若那张卡处于"延迟创建预览"状态，卡面不会重建 ⇒ 再显式调一次（幂等）。
-			try { cur.CreateSprite(); } catch { }
-			Log("模仿者卡（卡槽）→ " + want.saveKey + "（原=" + cfg.saveKey + "）");
+
+			// 目标精灵：被模仿植物的卡面（按 saveKey 优先，回落角色名）
+			Resource targetScene = null;
+			if (want != null)
+			{
+				if (!string.IsNullOrEmpty(want.saveKey) && dict.ContainsKey(want.saveKey))
+				{
+					targetScene = dict[want.saveKey];
+				}
+				else if (want.characterConfig != null)
+				{
+					targetScene = rm.GetCharacterSprite(want.characterConfig.name);
+				}
+			}
+			else
+			{
+				// want == null ⇒ 换回模仿者自己的精灵
+				if (dict.ContainsKey(MyKey))
+				{
+					targetScene = dict[MyKey];
+				}
+				else
+				{
+					TowerDefensePacketConfig self = TowerDefenseManager.GetPacketConfig(MyKey);
+					if (self != null && GodotObject.IsInstanceValid(self) && self.characterConfig != null)
+					{
+						targetScene = rm.GetCharacterSprite(self.characterConfig.name);
+					}
+				}
+			}
+			if (targetScene == null || !GodotObject.IsInstanceValid(targetScene))
+			{
+				return;              // 拿不到就不动，保持原样
+			}
+
+			// ── 先把"卡面参数"准备好（必须在**字典替换的窗口内**重建精灵）──
+			//   ★★ v1.4.2 修正：v1.4.1 把 `Init()+CreateSprite()` 放在了**还原字典之后**
+			//   ⇒ 精灵被按"模仿者自己"又重建了一次 ⇒ 卡面回到灰精灵、而费用/背景已经是
+			//   被模仿植物的（用户截图就是这个症状）。
+			//   `CreateSprite()` 是同步的：`sprite = GetPacketSprite(config)`
+			//   → 读 `CHARCTAER_SPRITE[config.saveKey]`（saveKey 恒为 MyKey）
+			//   ⇒ **只能在字典被换掉的窗口内调用**。
+			TowerDefensePacketConfig cfg = SafeConfig(card);
+			TowerDefensePacketConfig refCfg = (want != null)
+				? want
+				: TowerDefenseManager.GetPacketConfig(MyKey);
+			if (cfg != null)
+			{
+				// ① 背景（稀有度）+ 阳光数量 + 「+」号：全部走 `_override`
+				//    （`_GetType()` → `_override.type`；`GetCost()` → `_override.cost`；
+				//      `GetCostRise()` → `_override.costRise`（-1 = 不显示「+」））
+				if (want != null)
+				{
+					TowerDefensePacketOverride ov = new TowerDefensePacketOverride();
+					ov.type = want._GetType();
+					ov.cost = want.GetCostBeforeModifiers();
+					ov.costRise = want.GetCostRise();
+					ov.costMultiple = want.GetCostMultiple();
+					// ★ v1.4.3（用户："冷却时间还不对"）：**冷却也要跟随被模仿植物**。
+					//   `GetPacketCooldown()` / `GetStartingCooldown()` 的取值顺序（源码实证）：
+					//       _override.xxx ≠ -1 ⇒ 用它 × 倍率；否则用 characterConfig.xxx × 倍率
+					//   倍率里含 `ApplyMapPacketCooldownRules(_GetType(), …)` —— 我们的
+					//   `_GetType()` 已被设成目标植物的 ⇒ 倍率一致
+					//   ⇒ **这里必须写"基础值"**（`characterConfig` 上的原始值），
+					//     写成 `want.GetPacketCooldown()` 会把倍率乘两次 ✗
+					TowerDefenseCharacterConfig wc = want.characterConfig;
+					if (wc != null && GodotObject.IsInstanceValid(wc))
+					{
+						ov.packetCooldown = wc.packetCooldown;
+						ov.startingCooldown = wc.startingCooldown;
+					}
+					cfg._override = ov;
+				}
+				else
+				{
+					cfg._override = null;      // 还原成模仿者自己的卡面
+				}
+				// ② 预览片段/偏移/缩放 也要先设好 —— `CreateSprite()` 会用它选动画
+				if (refCfg != null && GodotObject.IsInstanceValid(refCfg))
+				{
+					cfg.packetAnimeClip = refCfg.packetAnimeClip;
+					cfg.packetAnimeOffset = refCfg.packetAnimeOffset;
+					cfg.packetAnimeScale = refCfg.packetAnimeScale;
+				}
+			}
+
+			// ── 换字典 → 重建卡面 → 立刻还原字典（这一段是原子的）──
+			bool hadKey = dict.ContainsKey(MyKey);
+			Resource orig = hadKey ? dict[MyKey] : null;
+			dict[MyKey] = targetScene;
+			try
+			{
+				if (cfg != null)
+				{
+					try { card.Init(cfg); }        // 重算费用/背景 + 内部 CreateSprite
+					catch { }
+				}
+				try { card.CreateSprite(); }        // 保险再重建一次（幂等）
+				catch { }
+			}
+			finally
+			{
+				if (hadKey)
+				{
+					dict[MyKey] = orig;
+				}
+				else
+				{
+					dict.Remove(MyKey);
+				}
+			}
+
+			// ★ v1.4.4：**皮肤（装扮）也要跟随被模仿植物**
+			ApplyTargetSkin(card, want);
 		}
 		catch (Exception ex)
 		{
 			if (_diag < 42)
 			{
 				_diag = 42;
-				Log("换卡异常（本条只报一次）：" + ex.Message);
+				Log("换卡面异常（本条只报一次）：" + ex.Message);
 			}
 		}
 	}
 
 	/// <summary>
-	/// 把一张**已被替换过**的模仿者卡**还原成模仿者本体**。
-	/// 触发时机：`_lastPlant` 变空（玩家把"最后选择的植物"取消掉了）——
-	/// 对应用户要求"如果取消选择最后选择的植物，那么模仿者也要取消选择"。
-	/// 实现：用 `originalSaveKey`（替换前就被 `Init` 固化成 `ImitaterClassic`，替换过程中不会变）
-	/// 反查回本体 config 再 `Init`，无需额外缓存。
+	/// ★ v1.4.4：把**被模仿植物的皮肤（装扮）**套到卡面精灵上。
+	///
+	/// 源码依据：
+	///   · 皮肤键存在存档里 —— `XWModPlayerProgressService.GetPacketState(saveKey)["Key"]["Custom"]`
+	///     （`InformationPanel.EquipmentButtonPressed()` 就是往这儿写的）；
+	///   · 应用方式是**图层替换**（不是换精灵场景）——
+	///     `characterConfig.customData.SetCustomFliters(sprite, customKey)`
+	///     然后 `sprite.UpdateMediaReplaceData(); sprite.UpdateChild();`
+	///     （见 `TowerDefenseInGamePacketShow.OnCharacterSkinSwitched`）。
+	/// 我们的卡面精灵是从**被模仿植物**的场景实例化出来的，但皮肤滤镜没人给它套
+	/// （卡自己的 `config.saveKey` 是模仿者，收不到那个植物的皮肤切换事件）
+	/// ⇒ 这里手动补上。
 	/// </summary>
-	private void RestoreToImitater(TowerDefenseInGamePacketShow cur)
+	private void ApplyTargetSkin(TowerDefenseInGamePacketShow card, TowerDefensePacketConfig want)
 	{
 		try
 		{
-			TowerDefensePacketConfig cfg = SafeConfig(cur);
-			if (cfg == null || cfg.saveKey == MyKey)
-			{
-				return;      // 本来就是模仿者本体 ⇒ 无需还原
-			}
-			string origKey = cur.originalSaveKey;
-			if (string.IsNullOrEmpty(origKey))
-			{
-				origKey = MyKey;
-			}
-			TowerDefensePacketConfig orig = TowerDefenseManager.GetPacketConfig(origKey);
-			if (orig == null || !GodotObject.IsInstanceValid(orig))
+			if (want == null || !GodotObject.IsInstanceValid(want) || string.IsNullOrEmpty(want.saveKey))
 			{
 				return;
 			}
-			TowerDefensePacketConfig copy = orig.Duplicate() as TowerDefensePacketConfig;
-			if (copy == null || !GodotObject.IsInstanceValid(copy))
+			object spObj = GetMember(card, "sprite");
+			if (!(spObj is AdobeAnimateSprite spr) || !GodotObject.IsInstanceValid(spr))
 			{
 				return;
 			}
-			copy.@override = null;
-			cur.Cover(copy, null, false, true);
-			try { cur.CreateSprite(); } catch { }
-			Log("模仿者卡已还原（没有可模仿的植物了）→ " + origKey);
+			// 用**全局**配置（不是每局的副本）取 customData，保证皮肤表是全的
+			TowerDefensePacketConfig global = TowerDefenseManager.GetPacketConfig(want.saveKey);
+			if (global == null || !GodotObject.IsInstanceValid(global) || global.characterConfig == null)
+			{
+				return;
+			}
+			CharacterCustomData cd = global.characterConfig.customData;
+			if (cd == null || !GodotObject.IsInstanceValid(cd))
+			{
+				return;
+			}
+			string skinKey = "";
+			try
+			{
+				Godot.Collections.Dictionary st = XWModPlayerProgressService.GetPacketState(want.saveKey);
+				if (st != null && st.ContainsKey("Key"))
+				{
+					Godot.Collections.Dictionary kd = st["Key"].AsGodotDictionary();
+					if (kd != null && kd.ContainsKey("Custom"))
+					{
+						skinKey = kd["Custom"].AsString();
+					}
+				}
+			}
+			catch { }
+
+			cd.ClearCustomFliters(spr);
+			if (!string.IsNullOrEmpty(skinKey) && cd.customDictionary.ContainsKey(skinKey))
+			{
+				cd.SetCustomFliters(spr, skinKey);
+			}
+			spr.UpdateMediaReplaceData();
+			spr.UpdateChild();
+			// ★★ v1.4.5：卡面精灵是**冻结预览态**（游戏 `CreateSprite()` →
+			//   `FreezePreparedPreviewTree()` 会 `SetFrozenPreview(true)`），
+			//   改完滤镜/媒体替换后**必须重新提交一次渲染**，否则画面还停在旧帧
+			//   ⇒ 表现就是"皮肤没生效"。
+			//   对照游戏自己的 `TowerDefenseInGamePacketShow.OnCharacterSkinSwitched()`：
+			//       ClearCustomFliters → SetCustomFliters → UpdateMediaReplaceData
+			//       → UpdateChild → RefreshManagedSlotSpriteCacheForRender() → FreezePreviewTree(forcePoseRefresh:true)
+			//   其中 `RefreshManagedSlotSpriteCacheForRender()` 是 **internal**
+			//   （跨程序集调不到）⇒ 用公开的 `QueueRedraw()` +
+			//   `EnsureFrozenPreviewRenderSubmission()` 做等价替代：
+			//   `FreezePreviewTree()` 里那句 `EnsureFrozenPreviewRenderSubmission()`
+			//   就是"冻结态下重新提交渲染"的公开入口。
+			spr.QueueRedraw();
+			if (spr.IsFrozenPreview)
+			{
+				spr.EnsureFrozenPreviewRenderSubmission();
+			}
+			Log("卡面已套用被模仿植物的皮肤：" + want.saveKey + " / 「" + skinKey + "」");
+		}
+		catch (Exception ex)
+		{
+			if (_diag < 45)
+			{
+				_diag = 45;
+				Log("套皮肤异常（本条只报一次）：" + ex.Message);
+			}
+		}
+	}
+
+	/// <summary>
+	/// ★ v1.4.4：**让卡面价格跟着被模仿植物同步变动**。
+	///
+	/// 源码依据 `TowerDefenseInGamePacketShow.RefreshDynamicItemCost()`：
+	/// ```csharp
+	/// baseItemCost = config.GetCost();
+	/// long num = baseItemCost;
+	/// if (!TowerDefenseManager.MapIgnoresDynamicPacketCostGrowth(config._GetType())) {
+	///     int characterNum = TowerDefenseManager.Instance.GetCharacterNum(config.saveKey);  // ★ 按 saveKey 数
+	///     if (costMultiple != -1.0) num = floor(num * pow(costMultiple, characterNum));
+	///     if (riseCost != -1) num += characterNum * riseCost;
+	/// }
+	/// itemCost = num;
+	/// ```
+	/// ⇒ 游戏是**按卡自己的 `saveKey`** 数"场上有几株"来涨价的；我们的卡 saveKey 是
+	/// `ImitaterClassic`（种下后立刻变身走人，计数恒 0）⇒ **金/钻/彩等"越种越贵"的植物
+	/// 涨价完全跟不上**。
+	/// ⇒ 这里按**被模仿植物的 saveKey** 重算一遍，直接写 `card.itemCost`
+	/// （该属性 setter 内部会自动刷标签，见 PacketShow L491~504）。
+	/// 注意用 `want.GetCost()` 取基准价 —— 它会把目标植物自己的**变价行为**也算进去，
+	/// 所以关卡改价/夜间价等场景同样能同步。
+	/// </summary>
+	private void SyncMimicCost(TowerDefenseInGamePacketShow card, TowerDefensePacketConfig want)
+	{
+		try
+		{
+			if (want == null || !GodotObject.IsInstanceValid(want))
+			{
+				return;
+			}
+			TowerDefenseManager mgr = TowerDefenseManager.Instance;
+			if (mgr == null || !GodotObject.IsInstanceValid(mgr))
+			{
+				return;
+			}
+			long v = (long)want.GetCost();
+			if (!TowerDefenseManager.MapIgnoresDynamicPacketCostGrowth(want._GetType()))
+			{
+				int n = mgr.GetCharacterNum(want.saveKey);
+				if (card.costMultiple != -1.0)
+				{
+					double d = (double)v * Math.Pow(card.costMultiple, n);
+					if (!double.IsNaN(d) && d > 0.0 && d <= 9.223372036854776E18)
+					{
+						v = (long)Math.Floor(d);
+					}
+				}
+				if (card.riseCost != -1)
+				{
+					v += (long)n * (long)card.riseCost;
+				}
+			}
+			if (card.itemCost != v)
+			{
+				card.itemCost = v;
+			}
+		}
+		catch { }
+	}
+
+	/// <summary>
+	/// ★ v1.5.0：取"这张卡槽里的模仿者卡应该跟随哪一张" —— 查 <see cref="_bankTargets"/>
+	/// （由 <see cref="DriveSeedBank"/> 每帧按"左邻最近实卡"重建）；
+	/// 查不到（这张卡不在卡槽 / 表还没建）时回退到全局 <see cref="_lastPlant"/>。
+	/// </summary>
+	private TowerDefensePacketConfig TargetOfCard(TowerDefenseInGamePacketShow card)
+	{
+		try
+		{
+			if (card != null && GodotObject.IsInstanceValid(card))
+			{
+				if (_bankTargets.TryGetValue(card.GetInstanceId(), out TowerDefensePacketConfig t)
+					&& t != null && GodotObject.IsInstanceValid(t))
+				{
+					return t;
+				}
+				// ── 兜底：表里没有（例如卡刚被拿起、本帧表还没建到它）⇒
+				//    直接在 `packetList` 里按**位置**往前找最近一张实卡。
+				TowerDefenseManager mgr = TowerDefenseManager.Instance;
+				TowerDefenseInGameSeedBank sb = (mgr != null && GodotObject.IsInstanceValid(mgr))
+					? mgr.GetSeedBank() : null;
+				if (sb != null && GodotObject.IsInstanceValid(sb))
+				{
+					TowerDefensePacketConfig prev = null;
+					foreach (TowerDefenseInGamePacketShow c in sb.packetList)
+					{
+						if (c == null || !GodotObject.IsInstanceValid(c))
+						{
+							continue;
+						}
+						if (ReferenceEquals(c, card))
+						{
+							if (prev != null)
+							{
+								return prev;
+							}
+							break;         // 它是第一张 ⇒ 没有左邻 ⇒ 走下面全局兜底
+						}
+						if (c.originalSaveKey == MyKey)
+						{
+							continue;
+						}
+						TowerDefensePacketConfig cf = SafeConfig(c);
+						if (cf != null && cf.saveKey != MyKey && cf.characterConfig is TowerDefensePlantConfig)
+						{
+							prev = cf;
+						}
+					}
+				}
+			}
+		}
+		catch { }
+		return (_lastPlant != null && GodotObject.IsInstanceValid(_lastPlant)) ? _lastPlant : null;
+	}
+
+	/// <summary>
+	/// ★★ v1.5.0：把"变身目标卡池"指向**当前拿起的那张模仿者卡的目标**。
+	///
+	/// 为什么必须在"拿起时"决定：内置 `TowerDefensePlantImitater.Explode()`
+	/// （种下、旋转动画播完之后才跑）是从角色的 `packetBank` 里
+	/// `GetCategory("White") + GetCategory("Original")` 再 `PickRandom()` 抽一张
+	/// ⇒ 我们只要把池收窄成"只剩目标那一张"结果就确定（见 <see cref="PointColourBankAt"/>）。
+	/// 但卡槽里可能**同时存在多张目标不同**的模仿者卡，而池只能有一份内容
+	/// ⇒ 唯一正确的时机就是**玩家拿起卡的那一刻**（要种下必然先拿起）。
+	/// 放下后**继续锁存、不还原** —— 因为 `Explode()` 那时才跑（见 <see cref="_latchedTarget"/>）。
+	/// 拿起非模仿者卡时**不动**（模仿者以外的植物不会走 `Explode()`）。
+	/// </summary>
+	private void PointColourBankAtHeld()
+	{
+		try
+		{
+			TowerDefenseInGamePacketShow held = GetBattleSlotPacket();
+			if (held != null && GodotObject.IsInstanceValid(held) && held.originalSaveKey == MyKey)
+			{
+				TowerDefensePacketConfig t = TargetOfCard(held);
+				if (t != null && GodotObject.IsInstanceValid(t))
+				{
+					if (!ReferenceEquals(_latchedTarget, t))
+					{
+						Log("拿起模仿者卡 ⇒ 变身目标锁存为 " + t.saveKey);
+					}
+					_latchedTarget = t;
+				}
+			}
+			TowerDefensePacketConfig use = (_latchedTarget != null && GodotObject.IsInstanceValid(_latchedTarget))
+				? _latchedTarget
+				: _lastPlant;
+			PointColourBankAt(use);
+		}
+		catch { }
+	}
+
+	/// <summary>
+	/// 把自定义卡池 `ImitaterClassicColour` 的 `White` 收窄成"只有 `want` 这一张"，
+	/// 这样模仿者 `Explode()` 里的 `array.PickRandom()` 必然抽到它 ⇒ 变身结果确定。
+	/// `want == null` 时**不动**（保持满池，随机取卡玩法那条路继续可用）。
+	/// </summary>
+	private void PointColourBankAt(TowerDefensePacketConfig want)
+	{
+		try
+		{
+			if (want == null || !GodotObject.IsInstanceValid(want) || string.IsNullOrEmpty(want.saveKey))
+			{
+				return;
+			}
+			TowerDefensePacketBankData bank = TowerDefenseManager.GetPacketBankData(CustomBank);
+			if (bank == null || !GodotObject.IsInstanceValid(bank))
+			{
+				return;
+			}
+			Godot.Collections.Array arr = bank.GetCategory("White");
+			if (arr != null && arr.Count == 1 && arr[0].AsString() == want.saveKey)
+			{
+				return;                     // 已经指向它了 ⇒ 幂等
+			}
+			var one = new Godot.Collections.Array();
+			one.Add(want.saveKey);
+			bank.category["White"] = one;
+			bank.category["Original"] = new Godot.Collections.Array();
+			Log("变身目标已锁定：" + want.saveKey);
 		}
 		catch { }
 	}
@@ -767,78 +1151,6 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 		catch { }
 		return false;
 	}
-
-	// ================================================================ 模仿者变身特效
-
-	/// <summary>
-	/// 补播 **模仿者变身特效**。
-	///
-	/// 为什么需要补：我们用 `Cover()` 把卡槽那张卡换成了"被模仿植物本体"，
-	/// 于是种下时走的是那张植物自己的创建流程，**不会经过
-	/// `TowerDefensePlantImitater.Explode()`**，那份"旋转+云"的特效就丢了。
-	/// 这里在"种下成功"的信号上手动补一份（与内置 `Explode()` 第一段完全一致）：
-	///     `TowerDefenseManager.CreateEffectParticlesOnce(IMITATER_CLOUD, gridPos)`
-	/// 位置取**鼠标所在格**（玩家点哪就种哪，所以与落点一致）。
-	/// </summary>
-	private void SpawnImitaterCloud()
-	{
-		try
-		{
-			if (_cloudSceneId == 0)
-			{
-				PackedScene sc = GD.Load<PackedScene>(ImitaterCloudUid);
-				if (sc == null || !GodotObject.IsInstanceValid(sc))
-				{
-					Log("拿不到模仿者变身影粒子场景（" + ImitaterCloudUid + "），特效跳过。");
-					_cloudSceneId = 1;      // 打一次就够，别每帧刷
-					return;
-				}
-				_cloudSceneId = sc.GetInstanceId();
-				_cloudScene = sc;
-			}
-			if (_cloudScene == null || !GodotObject.IsInstanceValid(_cloudScene) || _cloudSceneId == 1)
-			{
-				return;
-			}
-			TowerDefenseManager mgr = TowerDefenseManager.Instance;
-			if (mgr == null || !GodotObject.IsInstanceValid(mgr))
-			{
-				return;
-			}
-			Viewport vp = mgr.GetViewport();
-			if (vp == null || !GodotObject.IsInstanceValid(vp))
-			{
-				return;
-			}
-			Vector2I gridPos = mgr.GetMapGridPosFromMouse(vp.GetMousePosition());
-			Node effect = TowerDefenseManager.CreateEffectParticlesOnce(_cloudScene, gridPos);
-			if (effect == null || !GodotObject.IsInstanceValid(effect))
-			{
-				return;
-			}
-			Vector2 pos = TowerDefenseManager.GetMapCellPlantPos(gridPos);
-			if (effect is Node2D n2)
-			{
-				n2.GlobalPosition = pos;
-			}
-			Node holder = TowerDefenseManager.GetCharacterNode();
-			if (holder != null && GodotObject.IsInstanceValid(holder))
-			{
-				holder.AddChild(effect, false, Node.InternalMode.Disabled);
-			}
-			Log("已补播模仿者变身特效（格子 " + gridPos.X + "," + gridPos.Y + "）。");
-		}
-		catch (Exception ex)
-		{
-			if (_diag < 43)
-			{
-				_diag = 43;
-				Log("补播变身特效失败（本条只报一次）：" + ex.Message);
-			}
-		}
-	}
-
-	private PackedScene _cloudScene;
 
 	// ================================================================ 卡池归置
 
@@ -1061,6 +1373,8 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 			_lastPlant = null;
 			_battlePick = null;
 			_slotShown.Clear();
+			_bankTargets.Clear();
+			_latchedTarget = null;
 			_lastBankSeq = null;
 			if (had)
 			{
@@ -1068,6 +1382,177 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 			}
 		}
 		catch { }
+	}
+
+	// ================================================================ 自制关卡（关卡编辑器）卡池
+
+	/// <summary>已注入过 Mod 植物的编辑器卡池对象 ID。</summary>
+	private ulong _editorDataId;
+
+	/// <summary>
+	/// ★★ v1.3.4（用户："模仿者在自制关卡页面中无法找到，也没有 mod 类植物显示"）：
+	/// **自制关卡的卡池是另一套** —— `LevelEditorPacketBank`（`Prefab/GUI/LevelEditor/
+	/// MapEditor/PacketBank/`），它的数据来自全局 `ResourceManager.TOWERDEFENSE_PACKETBANKS["Total"]`
+	/// （`TryLoadDefaultPacketBank()`），**完全不走** `XWModContentCatalog.WithPlants()`
+	/// ⇒ 选卡界面/图鉴里能看到的 Mod 植物，在关卡编辑器里一个都不显示。
+	///
+	/// 处理：
+	///   ① 往编辑器卡池数据里注入 `ModPlants` 类别（直接借用官方 `WithPlants()`——
+	///      它就是"深拷贝 category + 塞 ModPlants"，我们只取那一项，不整体替换，避免每帧深拷贝）；
+	///   ② 顺带把每张 Mod 植物塞进它**自己的稀有度分类**（模仿者是彩卡 ⇒ 彩卡页也能找到）；
+	///   ③ 在编辑器的分类按钮列（`VBoxContainer`）末尾补一个「Mod植物」按钮
+	///      （实例化官方 `PacketCategoryButton.tscn`，外观与其它按钮一致），
+	///      点击切换 `CategoryChoose("ModPlants")`。
+	/// 每帧调用、幂等：按卡池对象 ID / 按钮是否存在判断。
+	/// </summary>
+	private void EnsureEditorBank()
+	{
+		try
+		{
+			LevelEditorPacketBank bank = LevelEditorPacketBank.Instance;
+			if (bank == null || !GodotObject.IsInstanceValid(bank))
+			{
+				return;
+			}
+			TowerDefensePacketBankData data = bank.data;
+			if (data == null || !GodotObject.IsInstanceValid(data))
+			{
+				return;
+			}
+
+			// ── ① ModPlants 类别 ──────────────────────────────────
+			if (_editorDataId != data.GetInstanceId())
+			{
+				_editorDataId = data.GetInstanceId();
+				TowerDefensePacketBankData withMods = XWModContentCatalog.WithPlants(data);
+				if (withMods != null && GodotObject.IsInstanceValid(withMods)
+					&& withMods.category.ContainsKey("ModPlants"))
+				{
+					Godot.Collections.Array mods = withMods.category["ModPlants"].AsGodotArray();
+					if (mods != null && mods.Count > 0)
+					{
+						data.category["ModPlants"] = mods;
+						Log("自制关卡卡池：已注入 Mod 植物 " + mods.Count + " 张（ModPlants）。");
+					}
+				}
+				// ── ② 同时塞进各自稀有度分类（找不到就在里面）─────────
+				foreach (XWModContentCatalog.Packet pk in XWModContentCatalog.GetPackets(plants: true))
+				{
+					TowerDefensePacketConfig cfg = pk.Config;
+					if (cfg == null || !GodotObject.IsInstanceValid(cfg))
+					{
+						continue;
+					}
+					string cat = RarityCategoryName(cfg.type);
+					if (string.IsNullOrEmpty(cat) || !data.category.ContainsKey(cat))
+					{
+						continue;
+					}
+					Godot.Collections.Array arr = data.category[cat].AsGodotArray();
+					if (arr == null)
+					{
+						continue;
+					}
+					if (!arr.Contains(pk.Key))
+					{
+						arr.Add(pk.Key);
+						data.category[cat] = arr;
+						Log("自制关卡卡池：把 " + pk.Key + " 追加进「" + cat + "」分类。");
+					}
+				}
+			}
+
+			// ── ③ 「Mod植物」按钮（不存在才建；幂等）──────────────
+			Node vb = bank.GetNodeOrNull("VBoxContainer");
+			if (vb != null && vb.GetNodeOrNull("CardModPlantsEditor") == null)
+			{
+				AddEditorModButton(vb);
+			}
+		}
+		catch (Exception ex)
+		{
+			if (_diag < 60)
+			{
+				_diag = 60;
+				Log("自制关卡卡池处理异常（本条只报一次）：" + ex.Message);
+			}
+		}
+	}
+
+	/// <summary>PACKET_TYPE → 卡池分类名。</summary>
+	private static string RarityCategoryName(TowerDefenseEnum.PACKET_TYPE t)
+	{
+		switch (t)
+		{
+			case TowerDefenseEnum.PACKET_TYPE.WHITE: return "White";
+			case TowerDefenseEnum.PACKET_TYPE.GOLD: return "Gold";
+			case TowerDefenseEnum.PACKET_TYPE.DIAMOND: return "Diamond";
+			case TowerDefenseEnum.PACKET_TYPE.COLOUR: return "Colour";
+			case TowerDefenseEnum.PACKET_TYPE.STAR: return "Star";
+			case TowerDefenseEnum.PACKET_TYPE.ORIGINAL: return "Original";
+			default: return "";
+		}
+	}
+
+	/// <summary>在编辑器分类按钮列末尾加「Mod植物」按钮（实例化官方按钮场景，外观一致）。</summary>
+	private void AddEditorModButton(Node vbox)
+	{
+		try
+		{
+			PackedScene sc = GD.Load<PackedScene>(
+				"res://Registry/Battle/Feature/PacketBank/PacketBank/PacketCategory/PacketCategoryButton.tscn");
+			if (sc == null || !GodotObject.IsInstanceValid(sc))
+			{
+				return;
+			}
+			PacketCategoryButton btn = sc.Instantiate<PacketCategoryButton>(PackedScene.GenEditState.Disabled);
+			if (btn == null)
+			{
+				return;
+			}
+			btn.Name = "CardModPlantsEditor";
+			btn.category = "ModPlants";
+			btn.Visible = true;
+			Label lb = btn.GetNodeOrNull<Label>("LabelNode/Label");
+			if (lb != null)
+			{
+				lb.Text = "Mod植物";
+			}
+			vbox.AddChild(btn);
+			btn.OnChoose += cat => OnEditorCategoryChosen(btn, cat);
+			Log("自制关卡卡池：已新增「Mod植物」分类按钮。");
+		}
+		catch (Exception ex)
+		{
+			if (_diag < 61)
+			{
+				_diag = 61;
+				Log("新增编辑器分类按钮异常：:" + ex.Message);
+			}
+		}
+	}
+
+	/// <summary>编辑器分类按钮点击 ⇒ 走它自己的 `CategoryChoose`。</summary>
+	private void OnEditorCategoryChosen(PacketCategoryButton btn, string cat)
+	{
+		try
+		{
+			LevelEditorPacketBank bank = LevelEditorPacketBank.Instance;
+			if (bank == null || !GodotObject.IsInstanceValid(bank))
+			{
+				return;
+			}
+			bank.CategoryChoose(string.IsNullOrEmpty(cat) ? "ModPlants" : cat);
+			Log("自制关卡卡池：已切到「" + cat + "」分类。");
+		}
+		catch (Exception ex)
+		{
+			if (_diag < 62)
+			{
+				_diag = 62;
+				Log("编辑器分类切换异常：" + ex.Message);
+			}
+		}
 	}
 
 	// ================================================================ 工具
