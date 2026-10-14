@@ -42,4 +42,9 @@
     </Reference>
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\..\QrCodeBitmap.cs" Link="QrCodeBitmap.cs" />
+    <Compile Include="..\..\SponsorQrInjector.cs" Link="SponsorQrInjector.cs" />
+  </ItemGroup>
+
 </Project>

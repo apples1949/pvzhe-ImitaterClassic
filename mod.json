@@ -2,8 +2,8 @@
   "schemaVersion": 2,
   "id": "imitaterclassic",
   "name": "经典模仿者",
-  "version": "1.5.0",
-  "author": "本地",
+  "version": "1.7.1",
+  "author": "apples1949",
   "description": "新增植物「经典模仿者」（彩卡）：PvZ 1 代原版模仿者行为 —— 选中该卡后自动复制你上一次选择的植物种子包，按那张卡的花费与冷却种下，种完自动还原。若该卡由随机取卡类玩法给出（无\"上一次选择\"），则随机变成一张彩卡植物。（含托管运行时插件 Runtime/ModAssembly.dll）",
   "dependencies": [],
   "conflicts": [],
@@ -22,7 +22,7 @@
   "scripts": [],
   "runtimeAssembly": "Runtime/ModAssembly.dll",
   "runtimeEntryType": "ImitaterClassicEntry",
-  "runtimeApiVersion": 1,
+  "runtimeApiVersion": 3,
   "runtimeAssemblyPolicy": "optional",
   "blueprints": [],
   "translations": [],
@@ -33,6 +33,111 @@
     "Resources/Characters/Plants/ImitaterClassic/Scene/ImitaterClassic.tscn",
     "Resources/Characters/Plants/ImitaterClassic/Scene/ImitaterClassicComponentSet.tres",
     "Resources/Characters/Plants/ImitaterClassic/Sprite/ImitaterClassic.tscn",
+    "Resources/SponsorQR.png",
     "Runtime/ModAssembly.dll"
-  ]
+  ],
+  "settings": [
+    {
+      "key": "aboutChangelog",
+      "type": "text",
+      "label": "更新内容",
+      "group": "关于",
+      "content": "v1.7.1 · 2026-10-12\n修复「开多倍消耗后价格跟不上变动」：旧算法把倍数乘在**基准价**上、涨价在乘法之后才加 ⇒ 涨价那一段拿不到倍数（实测目标 400 + 每株涨价 100、×2 时显示 400×2+100×n = 900，应为 (400+100×n)×2 = 1200）。现在改成**先算出被模仿植物当前的真实价格（含它自己的涨价/变价），最后再乘倍数**，与游戏自己的算价式子逐字一致；显示与扣费都是这个值。\nv1.7.0 · 2026-10-12\n①**卡面变灰**：模仿者卡显示被模仿的植物时，卡面里的植物变成灰白（真去色），一眼区分「模仿卡」和「真的那张卡」。\n②**复制出的植物变灰**：模仿者种下后变身出来的那株植物是否也灰白。\n③两处灰度各有独立开关（功能组）。\n④**同一张植物只能被一张模仿卡模仿**：同一张植物再点卡池模仿者不会再多加一张；撞车时多出来的那张会自动移出卡槽。\nv1.6.0 · 2026-10-12\n修复「不能重复选取模仿」：选卡阶段反复点卡池模仿者，点一次多一张（默认开）。\n（更早略）"
+    },
+    {
+      "key": "allowMultipleCopy",
+      "type": "bool",
+      "label": "允许多次复制",
+      "group": "功能",
+      "default": true,
+      "description": "开启后：①选卡阶段反复点卡池里的模仿者卡，每点一次往卡槽里多加一张（可同时选多张，各自模仿左边那张植物）；②模仿者卡不跟着被模仿植物从卡槽移出；③模仿者卡种植使用后立即重置冷却。关掉则完整恢复游戏原生行为（再点一次=取消）。",
+      "applyMode": "immediate",
+      "affectsGameplay": true
+    },
+    {
+      "key": "greyMimicCard",
+      "type": "bool",
+      "label": "模仿者卡面变灰",
+      "group": "功能",
+      "default": true,
+      "description": "开启后：模仿者卡显示被模仿的植物时，卡面里的植物显示为灰白 ⇒ 一眼区分「模仿卡」和「真的那张卡」。关掉则卡面与被模仿植物完全一样。",
+      "applyMode": "immediate",
+      "affectsGameplay": false
+    },
+    {
+      "key": "greyMimicPlant",
+      "type": "bool",
+      "label": "复制出的植物变灰",
+      "group": "功能",
+      "default": true,
+      "description": "开启后：模仿者种下、变身出来的那株植物显示为灰白（＝游戏内置模仿者的表现）。关掉则与正常种下的植物完全一样。",
+      "applyMode": "immediate",
+      "affectsGameplay": false
+    },
+    {
+      "key": "addSunCost",
+      "type": "bool",
+      "label": "复制时增加阳光消耗",
+      "group": "功能",
+      "default": false,
+      "description": "开启后，模仿者卡牌显示的阳光 = 被模仿植物**当前的实际费用**（含它自己的涨价/变价）× 倍数（倍数在下面选）；卡面显示多少，种下就扣多少。",
+      "applyMode": "immediate",
+      "affectsGameplay": false
+    },
+    {
+      "key": "sunCostMultiplier",
+      "type": "enum",
+      "label": "阳光消耗倍数",
+      "group": "功能",
+      "default": "2",
+      "description": "复制时按几倍阳光计费（仅在开启上一项时生效）。",
+      "applyMode": "immediate",
+      "affectsGameplay": false,
+      "visibleWhen": {
+        "key": "addSunCost",
+        "op": "eq",
+        "value": true
+      },
+      "options": [
+        {
+          "value": "2",
+          "label": "2 倍"
+        },
+        {
+          "value": "3",
+          "label": "3 倍"
+        },
+        {
+          "value": "4",
+          "label": "4 倍"
+        },
+        {
+          "value": "5",
+          "label": "5 倍"
+        },
+        {
+          "value": "10",
+          "label": "10 倍"
+        }
+      ]
+    },
+    {
+      "key": "enableLog",
+      "type": "bool",
+      "label": "输出诊断日志",
+      "group": "诊断",
+      "description": "排查问题时打开，会把运行状态写进 godot.log。平时关掉，不刷日志。",
+      "applyMode": "immediate",
+      "affectsGameplay": false,
+      "default": false
+    },
+    {
+      "key": "aboutAuthor",
+      "type": "richtext",
+      "label": "作者与链接",
+      "group": "关于",
+      "content": "经典模仿者 v1.6.0 · 作者：apples1949\n\n[url=https://space.bilibili.com/186773722]B 站空间[/url]\n[url=https://apples1949.lanzouc.com/b007uuknqd]蓝奏云下载（密码 762b）[/url]\n\n本模组为玩家自制 Mod，与《植物大战僵尸杂交重制版》官方无隶属关系。\n赞助：微信扫码支持作者（见下方收款码图片）。"
+    }
+  ],
+  "playInstructions": "让模仿者回到原版行为，并支持自定义。\n1. 是否可多次复制、复制是否增加阳光消耗、增加几倍，都在配置页里改。\n2. 选项 → Mod 管理 → 原版复制模仿者 → 配置。"
 }

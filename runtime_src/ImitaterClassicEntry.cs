@@ -57,7 +57,57 @@ using PVZHE.ModEditor.ModSystem;
 /// </summary>
 public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 {
+	// 赞助码注入器（SponsorQrInjector.cs 共享组件）用的包根缓存
+	internal static string SponsorQrRoot = null;
+	private bool _settingsSubscribedIc;
+
+	private void OnRuntimeSettingsChanged(object keys)
+	{
+		try { OnRuntimeSettingsChangedImpl(keys); } catch { }
+	}
+
+	private void OnRuntimeSettingsChangedImpl(object keys)
+	{
+		try { ReadMultiCopySetting(_context); } catch { }
+		try { ReadSunCostSettings(_context); } catch { }
+		Log("配置已重读（多重复制/阳光消耗）。");
+	}
+
+
 	private const string P = "[ImitaterClassic] ";
+
+	// ---- P2-9：复制是否增加阳光消耗 + 倍数（用户要求）----
+		private const string KAddSunCost = "addSunCost";
+		private const string KMultiCopy = "allowMultipleCopy";
+		/// <summary>允许「多次复制」：模仿者卡**不再跟着被模仿植物被移出卡槽**（默认关 = 保持原行为）。</summary>
+		private XWModRuntimeContext _context;
+	private bool _settingsSubscribedIcEntry;
+
+	private void OnEntrySettingsChanged()
+	{
+		try
+		{
+			ReadMultiCopySetting(_context);
+			ReadSunCostSettings(_context);
+			ReadGreySettings(_context);
+			Log("配置已重读。");
+		}
+		catch { }
+	}
+
+	private static bool _allowMultipleCopy;
+	private readonly System.Collections.Generic.Dictionary<ulong, bool> _lastAliveSeen = new System.Collections.Generic.Dictionary<ulong, bool>();
+		private const string KSunMul = "sunCostMultiplier";
+		private static bool _addSunCost;
+		private static int _sunMul = 1;
+
+	// ---- v1.7.0：两处"变灰"开关（用户要求）----
+	/// <summary>卡面显示"被模仿的植物"时，是否把卡面里的植物**变灰**（默认开）。</summary>
+	private static bool _greyMimicCard = true;
+	/// <summary>模仿者变身出来的那株植物是否**变灰**（默认开＝游戏内置模仿者的表现）。</summary>
+	private static bool _greyMimicPlant = true;
+	private const string KGreyCard = "greyMimicCard";
+	private const string KGreyPlant = "greyMimicPlant";
 
 	/// <summary>本 Mod 新增的植物 key（= 场景名 = config.name = packet.saveKey）。</summary>
 	private const string MyKey = "ImitaterClassic";
@@ -89,7 +139,7 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 	private const double ImitaterTransformFallbackSec = 2.2;
 
 	/// <summary>诊断日志开关（走 GD.Print 直出，不受 Mod 日志总开关影响）。</summary>
-	private static readonly bool EnableLog = false;
+	private static bool EnableLog;   // 由 Initialize 从「Mod 配置」读取（原为编译期常量）
 
 	/// <summary>★ 开关（2026-09-29 用户指定，**默认开启**）：是否让本卡**同时**出现在「Mod 植物」页签。
 	///
@@ -138,10 +188,68 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 	/// <summary>诊断计数（只打前若干条）。</summary>
 	private int _diag;
 
+	/// <summary>v1.7.0「同一张植物只能被一张模仿卡模仿」的诊断计数。</summary>
+	private int _dupDiag;
+
 	// ================================================================ 生命周期
 
-	public void Initialize(XWModRuntimeContext context)
+	
+	// ============================================================ 配置面板接线
+	//
+	// mod.json 里声明了 enableLog（bool，默认 false）。
+	// 这里在 Initialize 读一次 —— 老宿主没有 context.Settings 时吞异常、按 false 处理。
+	// 用 Get<object> 而不是 Get<bool>：宿主把值存成 Dictionary<string, object>，
+	// 直接 Get<bool> 可能抛 InvalidCastException。
+
+	private static bool ReadLogSetting(XWModRuntimeContext context)
 	{
+		try
+		{
+			if (context == null)
+			{
+				return false;
+			}
+			object v = context.Settings.Get<object>("enableLog");
+			if (v is bool b)
+			{
+				return b;
+			}
+			if (v is string s && bool.TryParse(s, out bool sb))
+			{
+				return sb;
+			}
+			if (v is System.Text.Json.JsonElement je)
+			{
+				if (je.ValueKind == System.Text.Json.JsonValueKind.True) { return true; }
+				if (je.ValueKind == System.Text.Json.JsonValueKind.False) { return false; }
+			}
+			return false;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+public void Initialize(XWModRuntimeContext context)
+	{
+			try { SponsorQrRoot = context.PackageRoot; } catch { }
+			_context = context;
+			try
+			{
+				if (context?.Settings != null && !_settingsSubscribedIcEntry)
+				{
+					context.Settings.Changed += _ => OnEntrySettingsChanged();
+					_settingsSubscribedIcEntry = true;
+				}
+			}
+			catch { }
+			ReadSunCostSettings(context);   // P2-9：复制加阳光消耗 + 倍数
+			ReadMultiCopySetting(context);   // P2-9：是否允许多次复制
+			ReadGreySettings(context);       // v1.7.0：卡面变灰 / 复制出的植物变灰
+
+			EnableLog = false;   // ★ 2026-10-14 用户要求：默认关闭所有日志（原：EnableLog = ReadLogSetting(context)）
+
 		try
 		{
 			string root = (context == null) ? "<null>" : context.PackageRoot;
@@ -201,6 +309,7 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 
 	private void OnFrame()
 	{
+		try { SponsorQrInjector.Tick(Engine.GetMainLoop() as SceneTree, "经典模仿者", SponsorQrRoot, "Resources/SponsorQR.png"); } catch { }
 		try
 		{
 			if (_tree == null || !GodotObject.IsInstanceValid(_tree))
@@ -225,8 +334,9 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 
 			ResolveLastPlant(seedBank);        // ① 全局兜底目标
 			DriveSeedBank(seedBank);           // ② 卡槽：**逐张各自跟随左邻实卡**（内部建 _bankTargets）
+			EnforceMimicPlantGrayscale();      // ★ v1.7.0：按配置决定"变身出来的植物"要不要变灰
 			PointColourBankAtHeld();           // ②b 变身目标 = 当前拿起那张模仿者的目标（锁存）
-			EnforceImitaterSelectable();       // ③ 没有 ① 时卡池的模仿者卡置灰
+			EnforceImitaterSelectable();       // ③ 没有 ① 时卡池的模仿者卡置灰 + 维护"点一次加一张"的按压语义
 		}
 		catch (Exception ex)
 		{
@@ -382,7 +492,8 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 			//   ★ v1.4.0：判断"这张模仿者卡当前显示成哪张植物"改看 `_slotShown`
 			//   （不再看 `config.saveKey` —— 现在不改 config 了，见 ReskinCard 说明）。
 			//   必须独立成一遍：`DeletePacket()` 会改 `packetList`，不能在遍历中调用。
-			if (seedBank.hasGameStarted != true)
+			// ★ P2-9①：开了「多次复制」就不再跟随移除（模仿者卡可留着重用）
+			if (seedBank.hasGameStarted != true && !_allowMultipleCopy)
 			{
 				var toDelete = new System.Collections.Generic.List<TowerDefenseInGamePacketShow>();
 				foreach (TowerDefenseInGamePacketShow card in seedBank.packetList)
@@ -497,6 +608,11 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 			}
 
 			// ── (4b) 主循环：每张模仿者卡按**它自己的目标**换卡面 ────────
+			//   ★ v1.7.0：同时执行「同一张植物只能被一张模仿卡模仿」——
+			//   按**卡槽顺序从左到右先到先得**；抢不到唯一目标的那张卡会被移出卡槽
+			//   （收集到 `dupDrop`，循环结束后统一删，避免边遍历边改 `packetList`）。
+			var claimedTargets = new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal);
+			var dupDrop = new System.Collections.Generic.List<TowerDefenseInGamePacketShow>();
 			foreach (TowerDefenseInGamePacketShow card in seedBank.packetList)
 			{
 				if (card == null || !GodotObject.IsInstanceValid(card))
@@ -508,6 +624,19 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 					continue;                 // 只管我们的模仿者卡
 				}
 				TowerDefensePacketConfig want = TargetOfCard(card);
+				// ★ v1.7.0：同一张植物不能被两张模仿卡同时模仿（先到先得）
+				if (want != null && GodotObject.IsInstanceValid(want) && !string.IsNullOrEmpty(want.saveKey)
+					&& !claimedTargets.Add(want.saveKey))
+				{
+					dupDrop.Add(card);
+					if (_dupDiag < 20)
+					{
+						_dupDiag++;
+						Log("同一张植物只能被一张模仿卡模仿：「" + want.saveKey
+							+ "」已被前面的模仿卡占用 ⇒ 这张多余的模仿卡移出卡槽。");
+					}
+					continue;
+				}
 				string desired = (want == null) ? MyKey : want.saveKey;
 				ulong id = card.GetInstanceId();
 				bool needReskin = !_slotShown.TryGetValue(id, out string shown) || shown != desired;
@@ -529,6 +658,45 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 				}
 				// ★ v1.4.4：价格每帧跟随（涨价植物 / 关卡改价都能同步）
 				SyncMimicCost(card, want);
+				// ★ v1.6.1（用户要求）：卡面显示的是**被模仿的植物**时把卡面植物**变灰**
+				//   ⇒ 一眼区分"这是模仿卡"和"这是真的那张卡"；还原成模仿者本体时取消灰度。
+				//   放在 ReskinCard 之后的**同一帧**执行（`needReskin` 时也不会闪一帧原色）。
+				//   v1.7.0：受配置项「模仿者卡面变灰」控制。
+				ApplyMimicGrayscale(card, _greyMimicCard && want != null);
+				// ★ P2-9①落地：开了「允许多次复制」⇒ 模仿者卡种植后进 CD/变灰时
+				//   立即恢复可用（Reset + alive=true）——真正的"反复使用"。
+				if (_allowMultipleCopy && seedBank.hasGameStarted == true)
+				{
+					// 诊断：状态变化时打印（避免刷屏）
+					bool wasAlive = _lastAliveSeen.TryGetValue(id, out bool w) ? w : true;
+					if (wasAlive != card.alive)
+					{
+						Log("多次复制跟踪：模仿者卡 alive " + wasAlive + " → " + card.alive
+							+ (card.alive ? "" : " ⇒ 即将重置"));
+						_lastAliveSeen[id] = card.alive;
+					}
+					if (!card.alive)
+					{
+						card.alive = true;
+						card.Reset();
+						_lastAliveSeen[id] = true;
+						Log("多次复制：模仿者卡已重置可用。");
+					}
+				}
+			}
+
+			// ── (4c) ★ v1.7.0：把"抢不到唯一模仿目标"的多余模仿卡移出卡槽 ──
+			//   （必须在循环外删：`DeletePacket` 会改 `packetList`）
+			foreach (TowerDefenseInGamePacketShow dup in dupDrop)
+			{
+				if (dup == null || !GodotObject.IsInstanceValid(dup))
+				{
+					continue;
+				}
+				ulong dupId = dup.GetInstanceId();
+				_slotShown.Remove(dupId);
+				_slotSprite.Remove(dupId);
+				seedBank.DeletePacket(dup);
 			}
 		}
 		catch (Exception ex)
@@ -854,26 +1022,214 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 	}
 
 	/// <summary>
-	/// ★ v1.4.4：**让卡面价格跟着被模仿植物同步变动**。
+	/// ★ v1.6.1（用户要求）：**卡面显示的是被模仿植物时，把卡面里的植物变灰**
+	/// —— 一眼就能区分"这是模仿卡"和"这是真的那张卡"；还原成模仿者本体时取消灰度。
 	///
-	/// 源码依据 `TowerDefenseInGamePacketShow.RefreshDynamicItemCost()`：
+	/// ── 为什么用 `SetRenderGrayscale` 而不是自己叠 `Modulate` ──────────
+	/// 源码实证：游戏自己的"模仿者"标识走的就是这一套 ——
+	///   · `TowerDefensePlantImitater.Explode()` / `TowerDefensePlantImitaterW` /
+	///     `TowerDefenseZombieNormalImitater` 给变出来的角色加的都是
+	///     `SetSpriteGroupShaderParameter("imitater", true)`；
+	///   · `ShaderEffectComponent` 处理 `imitater` 这个着色器标记时执行的就是
+	///     `adobeAnimateSpriteBase.SetRenderGrayscale(IsImitaterEnabled())`
+	///     （`ShaderEffectComponent.cs:245`）。
+	/// ⇒ 卡面精灵同样是 `AdobeAnimateSprite`，直接调它的 `SetRenderGrayscale(bool)`
+	///   就是**与游戏本体同一套灰度渲染**（真去色，而不是把图压暗）。
+	///   `SetRenderGrayscale` 内部会 `InvalidateRenderSnapshotCache(force:true)` +
+    ///   `RequestNodeRedraw()`；卡面是**冻结预览态**时还要再提交一次渲染
+	///   （与本文件 `ApplyTargetSkin` 的收尾动作一致）。
+	/// </summary>
+	private void ApplyMimicGrayscale(TowerDefenseInGamePacketShow card, bool grey)
+	{
+		try
+		{
+			object spObj = GetMember(card, "sprite");
+			if (!(spObj is AdobeAnimateSprite spr) || !GodotObject.IsInstanceValid(spr))
+			{
+				return;
+			}
+			if (spr.IsRenderGrayscaleEnabled() == grey)
+			{
+				return;                       // 已一致 ⇒ 别重复让渲染快照失效
+			}
+			spr.SetRenderGrayscale(grey);
+			spr.QueueRedraw();
+			if (spr.IsFrozenPreview)
+			{
+				spr.EnsureFrozenPreviewRenderSubmission();
+			}
+			if (_greyDiag < 10)
+			{
+				_greyDiag++;
+				Log("模仿者卡面灰度：" + (grey ? "开（显示的是被模仿植物）" : "关（模仿者本体）"));
+			}
+		}
+		catch (Exception ex)
+		{
+			if (_diag < 48)
+			{
+				_diag = 48;
+				Log("卡面灰度异常（本条只报一次）：" + ex.Message);
+			}
+		}
+	}
+
+	/// <summary>卡面灰度诊断计数。</summary>
+	private int _greyDiag;
+
+	/// <summary>
+	/// ★ v1.7.0（用户要求）：按配置决定"**模仿者变身出来的那株植物**"要不要变灰。
+	///
+	/// ── 现状（源码实证）──────────────────────────────────────────────
+	/// 变出来的植物**本来就是灰的**：`TowerDefensePlantImitater.Explode()`
+	/// （我们 Mod 的植物 `ImitaterClassic` 继承它 ⇒ 走同一段代码）在
+	/// `packetConfig.Plant(gridPos)` 之后就是
+	/// `character.CallDeferred("SetSpriteGroupShaderParameter", "imitater", true)`
+	/// —— 游戏内置模仿者就是这个表现。
+	/// ⇒ **开关"开"时本函数什么都不做**（保持游戏原生，零开销、零风险）。
+	///
+	/// ── 开关"关"时怎么取消 ─────────────────────────────────────────
+	/// 用游戏自己的通道反向摘掉：对每株"当前处于灰度渲染"的植物调
+	/// `SetSpriteGroupShaderParameter("imitater", false)`（`ShaderEffectComponent`
+	/// 会据此把 `SetRenderGrayscale(false)` 重新应用到它的精灵上）。
+	/// 判据用 `TowerDefenseCharacter.sprite.IsRenderGrayscaleEnabled()` ——
+	/// 角色精灵上的灰度**只**由 `ShaderEffectComponent` 的 `imitater` 标记驱动
+	/// （`ShaderEffectComponent.cs:245`），所以这个判据恰好等价于"被加了 imitater 标记"，
+	/// 且是公开 API，不用反射读私有 `_effectFlags`。
+	/// ⚠️ 因此"关"会取消**所有**由模仿者变身产生的灰化（含游戏内置模仿者变出来的），
+	///    不只本 Mod 的 —— 这是刻意的：两者本来就是同一套机制。
+	/// </summary>
+	private void EnforceMimicPlantGrayscale()
+	{
+		if (_greyMimicPlant)
+		{
+			return;                     // 默认：保持游戏原生（变出来的植物是灰的）
+		}
+		try
+		{
+			TowerDefenseManager mgr = TowerDefenseManager.Instance;
+			if (mgr == null || !GodotObject.IsInstanceValid(mgr))
+			{
+				return;
+			}
+			foreach (Variant item in mgr.GetCharacter())
+			{
+				try
+				{
+					TowerDefenseCharacter c = item.AsGodotObject() as TowerDefenseCharacter;
+					if (c == null || !GodotObject.IsInstanceValid(c) || !(c is TowerDefensePlant))
+					{
+						continue;
+					}
+					AdobeAnimateSprite spr = c.sprite;
+					if (spr == null || !GodotObject.IsInstanceValid(spr) || !spr.IsRenderGrayscaleEnabled())
+					{
+						continue;
+					}
+					c.SetSpriteGroupShaderParameter("imitater", false);
+					if (_greyDiag < 10)
+					{
+						_greyDiag++;
+						Log("已按配置取消「复制出的植物」的灰度：" + (c.config != null ? c.config.name : c.GetType().Name));
+					}
+				}
+				catch { }
+			}
+		}
+		catch { }
+	}
+
+	/// <summary>读 P2-9 的两项设置：是否加阳光消耗、加几倍。</summary>
+	/// <summary>读「是否允许多次复制」设置（bool，默认 true = 选卡可多张）。</summary>
+	private void ReadMultiCopySetting(XWModRuntimeContext context)
+	{
+		try
+		{
+			if (context == null) { return; }
+			object v = context.Settings.Get<object>(KMultiCopy);
+			bool before = _allowMultipleCopy;
+			if (v is bool b) { _allowMultipleCopy = b; }
+			else if (v is string s && bool.TryParse(s, out bool sb)) { _allowMultipleCopy = sb; }
+			else if (v is System.Text.Json.JsonElement je
+				&& (je.ValueKind == System.Text.Json.JsonValueKind.True || je.ValueKind == System.Text.Json.JsonValueKind.False))
+			{
+				_allowMultipleCopy = je.GetBoolean();
+			}
+			try { if (EnableLog) { GD.Print(P + "多次复制设置：raw=" + (v?.ToString() ?? "null") + " ⇒ " + _allowMultipleCopy); } } catch { }
+		}
+		catch (Exception ex) { try { Log("多次复制设置读取异常：" + ex.Message); } catch { } }
+	}
+
+	private void ReadSunCostSettings(XWModRuntimeContext context)
+	{
+		try
+		{
+			if (context == null) { return; }
+			object b = context.Settings.Get<object>(KAddSunCost);
+			if (b is bool bb) { _addSunCost = bb; }
+			else if (b is System.Text.Json.JsonElement jb
+				&& (jb.ValueKind == System.Text.Json.JsonValueKind.True || jb.ValueKind == System.Text.Json.JsonValueKind.False))
+			{
+				_addSunCost = jb.GetBoolean();
+			}
+			object m = context.Settings.Get<object>(KSunMul);
+			if (m is System.Text.Json.JsonElement jm && jm.ValueKind == System.Text.Json.JsonValueKind.String
+				&& int.TryParse(jm.GetString(), out int n1)) { _sunMul = n1; }
+			else if (m is string sm && int.TryParse(sm, out int n2)) { _sunMul = n2; }
+			else { try { _sunMul = System.Convert.ToInt32(m); } catch { } }
+			if (_sunMul < 1) { _sunMul = 1; }
+			if (_sunMul > 10) { _sunMul = 10; }
+		}
+		catch { }
+	}
+
+	/// <summary>★ v1.7.0：读两个「变灰」开关（缺省 = 保持默认值）。</summary>
+	private void ReadGreySettings(XWModRuntimeContext context)
+	{
+		try
+		{
+			if (context == null) { return; }
+			object c = context.Settings.Get<object>(KGreyCard);
+			if (c is bool bc) { _greyMimicCard = bc; }
+			else if (c is string sc && bool.TryParse(sc, out bool sb)) { _greyMimicCard = sb; }
+			else if (c is System.Text.Json.JsonElement jc
+				&& (jc.ValueKind == System.Text.Json.JsonValueKind.True || jc.ValueKind == System.Text.Json.JsonValueKind.False))
+			{
+				_greyMimicCard = jc.GetBoolean();
+			}
+			object p = context.Settings.Get<object>(KGreyPlant);
+			if (p is bool bp) { _greyMimicPlant = bp; }
+			else if (p is string sp && bool.TryParse(sp, out bool sb2)) { _greyMimicPlant = sb2; }
+			else if (p is System.Text.Json.JsonElement jp
+				&& (jp.ValueKind == System.Text.Json.JsonValueKind.True || jp.ValueKind == System.Text.Json.JsonValueKind.False))
+			{
+				_greyMimicPlant = jp.GetBoolean();
+			}
+		}
+		catch { }
+	}
+
+	/// <summary>
+	/// ★ v1.4.4 起：**让卡面价格跟着被模仿植物同步变动**；v1.7.1 起倍数改为乘在"变动后的价格"上。
+	///
+	/// 源码依据 `TowerDefenseInGamePacketShow.RefreshDynamicItemCost()`（游戏对**每张卡自己**的算价式子）：
 	/// ```csharp
 	/// baseItemCost = config.GetCost();
 	/// long num = baseItemCost;
 	/// if (!TowerDefenseManager.MapIgnoresDynamicPacketCostGrowth(config._GetType())) {
 	///     int characterNum = TowerDefenseManager.Instance.GetCharacterNum(config.saveKey);  // ★ 按 saveKey 数
 	///     if (costMultiple != -1.0) num = floor(num * pow(costMultiple, characterNum));
-	///     if (riseCost != -1) num += characterNum * riseCost;
+	///     if (riseCost != -1)      num += characterNum * riseCost;
 	/// }
 	/// itemCost = num;
 	/// ```
 	/// ⇒ 游戏是**按卡自己的 `saveKey`** 数"场上有几株"来涨价的；我们的卡 saveKey 是
 	/// `ImitaterClassic`（种下后立刻变身走人，计数恒 0）⇒ **金/钻/彩等"越种越贵"的植物
 	/// 涨价完全跟不上**。
-	/// ⇒ 这里按**被模仿植物的 saveKey** 重算一遍，直接写 `card.itemCost`
-	/// （该属性 setter 内部会自动刷标签，见 PacketShow L491~504）。
-	/// 注意用 `want.GetCost()` 取基准价 —— 它会把目标植物自己的**变价行为**也算进去，
-	/// 所以关卡改价/夜间价等场景同样能同步。
+	/// ⇒ 这里按**被模仿植物的 saveKey** 照抄这条式子重算，直接写 `card.itemCost`
+	/// （该属性 setter 内部会自动刷标签；`PacketShow.TryResolveModItemCost()` 里
+	///  `cost = itemCost` ⇒ **显示与扣费是同一个值**）。
+	/// 基准价用 `want.GetCost()` —— 它把目标植物自己的**变价行为**（关卡改价/夜间价等）也算进去。
 	/// </summary>
 	private void SyncMimicCost(TowerDefenseInGamePacketShow card, TowerDefensePacketConfig want)
 	{
@@ -889,21 +1245,41 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 				return;
 			}
 			long v = (long)want.GetCost();
+			// ── ★ v1.7.1：**先算出目标植物"当前的真实价格"（含它自己的涨价/变价），最后再乘用户倍数** ──
+			//   源码依据 `TowerDefenseInGamePacketShow.RefreshDynamicItemCost()`：
+			//       baseItemCost = config.GetCost();
+			//       n = GetCharacterNum(config.saveKey);
+			//       if (costMultiple != -1) num = floor(num * pow(costMultiple, n));
+			//       if (riseCost != -1)      num += n * riseCost;        // ← 涨价在乘法**之后**
+			//   ⇒ 这里完全照抄这条式子，但用**目标植物自己的** `GetCostMultiple()/GetCostRise()`
+			//     （不能用本卡那两个字段：本卡 `_override` 在这两项为 -1 时会回落到
+			//      "模仿者自己"的 `characterConfig`，口径就错了）。
+			//   ⚠️ 旧写法是"先把用户倍数乘在**基准价**上，再走涨价" ⇒ 涨价那一段永远拿不到倍数：
+			//      目标 400 + 涨价 100×n、×2 时显示 400×2 + 100×n = 900（用户实测），
+			//      而正确值应是 (400 + 100×n) × 2 = 1200。
 			if (!TowerDefenseManager.MapIgnoresDynamicPacketCostGrowth(want._GetType()))
 			{
 				int n = mgr.GetCharacterNum(want.saveKey);
-				if (card.costMultiple != -1.0)
+				double mul = want.GetCostMultiple();
+				if (mul != -1.0 && n > 0)
 				{
-					double d = (double)v * Math.Pow(card.costMultiple, n);
+					double d = (double)v * Math.Pow(mul, n);
 					if (!double.IsNaN(d) && d > 0.0 && d <= 9.223372036854776E18)
 					{
 						v = (long)Math.Floor(d);
 					}
 				}
-				if (card.riseCost != -1)
+				int rise = want.GetCostRise();
+				if (rise != -1)
 				{
-					v += (long)n * (long)card.riseCost;
+					v += (long)n * (long)rise;
 				}
+			}
+			// ★ P2-9：最后才乘"复制时增加阳光消耗"的倍数 ⇒ 倍数作用于**变动后的价格**
+			if (_addSunCost && _sunMul > 1)
+			{
+				long boosted = v * _sunMul;
+				if (boosted > 0) { v = boosted; }
 			}
 			if (card.itemCost != v)
 			{
@@ -1055,6 +1431,40 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 	///    `allowPressWhenUnavailable` 也压掉（恢复时还原）。
 	/// ⚠️ 已选中（`select`）或已锁定（`@lock`）的卡**不碰**。
 	/// </summary>
+	// ── ★ 性能：卡片节点列表缓存（整树递归很贵，15 帧内复用同一份）──
+	private readonly System.Collections.Generic.List<Node> _packetCache = new System.Collections.Generic.List<Node>();
+	private ulong _packetCacheFrame;
+
+	/// <summary>
+	/// 取场上全部 `TowerDefenseInGamePacketShow`（卡池 + 卡槽 + 图鉴里的卡）。
+	/// 旧实现每帧整树递归 + 新建 List：安卓实测这类"每帧全树走"约 3~5ms/帧
+	/// （同一模式在共享的 SponsorQrInjector 上实测 1155~1715µs/1226 节点，安卓更慢）。
+	/// 卡片集合不可能每帧变化 ⇒ 15 帧复用一次，并逐个校验节点仍有效。
+	/// </summary>
+	private System.Collections.Generic.List<Node> PacketListCached()
+	{
+		try
+		{
+			ulong f = Engine.GetProcessFrames();
+			if (_packetCache.Count > 0 && f - _packetCacheFrame < 15UL)
+			{
+				bool ok = true;
+				for (int i = 0; i < _packetCache.Count; i++)
+				{
+					Node n = _packetCache[i];
+					if (n == null || !GodotObject.IsInstanceValid(n)) { ok = false; break; }
+				}
+				if (ok) { return _packetCache; }
+			}
+			_packetCacheFrame = f;
+			_packetCache.Clear();
+			CollectByClassName(_tree != null && GodotObject.IsInstanceValid(_tree) ? _tree.Root : null,
+				0, "TowerDefenseInGamePacketShow", _packetCache, 400);
+			return _packetCache;
+		}
+		catch { return _packetCache; }
+	}
+
 	private void EnforceImitaterSelectable()
 	{
 		try
@@ -1078,9 +1488,8 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 			//
 			//   ⇒ 改用**祖先链判定**：只有挂在选卡界面 `TowerDefenseInGamePacketBank`
 			//     之下的卡才允许置灰；图鉴 / 其他界面一律不碰。
-			var cards = new System.Collections.Generic.List<Node>();
-			CollectByClassName(_tree != null && GodotObject.IsInstanceValid(_tree) ? _tree.Root : null,
-				0, "TowerDefenseInGamePacketShow", cards, 400);
+			// ★ 性能（2026-10-12）：不再每帧整树重扫（安卓上 3~5ms/帧）—— 见 PacketListCached()
+			var cards = PacketListCached();
 			foreach (Node node in cards)
 			{
 				TowerDefenseInGamePacketShow p = node as TowerDefenseInGamePacketShow;
@@ -1097,6 +1506,12 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 				{
 					continue;      // 不是选卡界面卡池的卡（图鉴/卡槽等）⇒ 一律不碰
 				}
+				// ★ v1.6.0：「允许多次复制」⇒ 把这张卡池卡的**按压语义**从游戏的
+				//   `PacketChoose`（再点一次会被当成"取消"）换成"再多选一张"（见
+				//   OnMimicPoolPressed / MaintainMimicPoolPress）。开关关掉时完整还原原生行为。
+				//   每帧维护（幂等 `-=`/`+=`）：卡池卡是虚拟化复用的，`ResetForPool()` 会把
+				//   `OnPressed` 整个清空，只靠"打过标记"会漏挂。
+				MaintainMimicPoolPress(p);
 				if (p.select || p.@lock)
 				{
 					continue;      // 已选中 / 已锁定 ⇒ 正常状态，不干预
@@ -1151,6 +1566,301 @@ public sealed class ImitaterClassicEntry : IXWModRuntimeEntry
 		catch { }
 		return false;
 	}
+
+	// ================================================================ ③-b 「允许多次复制」：卡池点一次 = 卡槽多一张
+	//
+	// 用户口径（2026-10-12 当面确认）：要的是**选卡阶段能一次选多张模仿者**。
+	//
+	// ── 为什么原样点不出来（源码实证）──────────────────────────────
+	// `TowerDefenseBattleFeaturePacketBank.PacketChoose(packet)` 的第一件事就是
+	// `FindSelectedPacket(packet.config.saveKey)`：卡槽里**已经有一张**同身份的卡时，
+	// 这一次点击被当成**取消**（`DeletePacket` + `PacketAlive`）⇒ 永远只能有一张。
+	// 日志实锤：卡槽 `[…][SunShroom][模仿者]` 再点一次 ⇒ `[…][SunShroom]`（模仿者消失），
+	// 点第三次才又在末尾出现一张。
+	//
+	// ── 做法（v1.6.0 定稿：**本 Mod 独占这张卡的按压语义**）─────────
+	// 开「允许多次复制」时，把游戏的 `PacketChoose` 从这个**卡池卡**的 `OnPressed` 上摘掉，
+	// 换上本 Mod 的 `OnMimicPoolPressed`（每帧幂等维护，见 MaintainMimicPoolPress）：
+	//   · 每次点击**严格 +1 张**——走游戏自己的 `packetBank.CreateAnime()`（深拷贝 config →
+	//     `seedBank.AddPacket` → 飞入动画），与原生 `PacketChoose` 的追加路径**逐字同一条**；
+	//   · **不删任何已有卡** ⇒ 多张模仿者各自的"左邻目标"不会被破坏；
+	//   · 卡池那张保持 `alive / select` ⇒ 可以继续点。
+	// 想**减少**一张照旧：点卡槽里那张模仿者卡（原生 `DeletePacket`）。
+	// ⚠️ 摘掉的只是"点这张卡"这一条路径 —— `PacketListChoose` / `PacketChooseFromName` /
+	//    「重新选卡」都是**直接调用** `PacketChoose(...)`，完全不受影响。
+	// ⚠️ 关掉开关时 MaintainMimicPoolPress 会把 `PacketChoose` 原样挂回去（完整还原原生行为）。
+
+	/// <summary>多次复制诊断计数。</summary>
+	private int _multiCopyDiag;
+
+	/// <summary>
+	/// 卡池那张模仿者卡被按下时的处理器（**本 Mod 独占它的按压语义**，见 ③-b 段头）。
+	///
+	/// 只做一件事：**往卡槽里再加一张**（严格 +1），然后让卡池那张保持可点。
+	/// 不删卡、不需要"点击前后张数差"补偿 —— 因为游戏的取消分支已经被摘掉了。
+	/// </summary>
+	private void OnMimicPoolPressed(TowerDefenseInGamePacketShow card)
+	{
+		try
+		{
+			if (!_allowMultipleCopy)
+			{
+				return;                  // 关着 ⇒ 语义已还原给游戏的 PacketChoose
+			}
+			if (card == null || !GodotObject.IsInstanceValid(card))
+			{
+				return;
+			}
+			// 卡池节点会被复用（`ResetForPool()` + `BindVirtualizedPacket()` 绑到别的植物）
+			// ⇒ 必须复核"此刻它还是模仿者卡、且还挂在选卡界面卡池下"
+			TowerDefensePacketConfig cfg = SafeConfig(card);
+			if (cfg == null || cfg.saveKey != MyKey || !IsInChooseBank(card))
+			{
+				return;
+			}
+			TowerDefenseManager mgr = TowerDefenseManager.Instance;
+			TowerDefenseInGameSeedBank seedBank = (mgr != null && GodotObject.IsInstanceValid(mgr))
+				? mgr.GetSeedBank() : null;
+			if (seedBank == null || !GodotObject.IsInstanceValid(seedBank) || seedBank.hasGameStarted == true)
+			{
+				return;                  // 只在**选卡阶段**接管；进战斗后交给 ② 的 CD 重置逻辑
+			}
+			if (!seedBank.CanAddPacket())
+			{
+				// 卡槽已满：与原生 `PacketChoose` 的满槽分支一致（`packet.Reset(); return;`）
+				// —— 不硬塞、也不把卡面留成"已选中"的样子
+				try { card.Reset(); } catch { }
+				if (_multiCopyDiag < 30)
+				{
+					_multiCopyDiag++;
+					Log("多次复制：卡槽已满，本次未追加。");
+				}
+				return;
+			}
+			// ★ v1.7.0：同一张植物只能被一张模仿卡模仿 —— 新卡会被追加到**卡槽末尾**，
+			//   它的"左邻实卡"就是牌组里最后一张植物 ⇒ 若这张植物已被别的模仿卡占用，
+			//   本次点击不追加（先选另一张植物再点），避免"连点两次得到两张一模一样的模仿卡"。
+			TowerDefensePacketConfig candidate = LastRealPlant(seedBank);
+			if (candidate == null)
+			{
+				try { card.Reset(); } catch { }
+				if (_dupDiag < 20)
+				{
+					_dupDiag++;
+					Log("还没有选择任何植物 ⇒ 模仿者无处可模仿，本次未追加（先选一张植物再点）。");
+				}
+				return;
+			}
+			if (IsImitationClaimed(seedBank, candidate))
+			{
+				try { card.Reset(); } catch { }
+				if (_dupDiag < 20)
+				{
+					_dupDiag++;
+					Log("「" + candidate.saveKey + "」已经被另一张模仿者卡模仿 ⇒ 同一张植物只能被一张模仿卡模仿，"
+						+ "先选另一张植物再点。");
+				}
+				return;
+			}
+			int added = AddMimicPacket(card) ? 1 : 0;
+			KeepPoolCardClickable(card);
+			if (_multiCopyDiag < 30)
+			{
+				_multiCopyDiag++;
+				Log("多次复制：点卡池模仿者 ⇒ 卡槽追加 " + added + " 张（现有 "
+					+ CountMimics(seedBank) + " 张）");
+			}
+		}
+		catch (Exception ex)
+		{
+			if (_diag < 46)
+			{
+				_diag = 46;
+				Log("多次复制追加异常（本条只报一次）：" + ex.Message);
+			}
+		}
+	}
+
+	/// <summary>卡槽里**最后一张实卡**（= 新模仿者卡追加到末尾后会模仿的那张）。</summary>
+	private static TowerDefensePacketConfig LastRealPlant(TowerDefenseInGameSeedBank seedBank)
+	{
+		TowerDefensePacketConfig last = null;
+		try
+		{
+			if (seedBank == null || !GodotObject.IsInstanceValid(seedBank) || seedBank.packetList == null)
+			{
+				return null;
+			}
+			foreach (TowerDefenseInGamePacketShow c in seedBank.packetList)
+			{
+				if (c == null || !GodotObject.IsInstanceValid(c) || c.originalSaveKey == MyKey)
+				{
+					continue;
+				}
+				TowerDefensePacketConfig cf = SafeConfig(c);
+				if (cf != null && cf.saveKey != MyKey && cf.characterConfig is TowerDefensePlantConfig)
+				{
+					last = cf;            // 越靠后越新
+				}
+			}
+		}
+		catch { }
+		return last;
+	}
+
+	/// <summary>卡槽里是否已经有模仿者卡在模仿这张植物（"同一张植物只能被一张模仿卡模仿"）。</summary>
+	private bool IsImitationClaimed(TowerDefenseInGameSeedBank seedBank, TowerDefensePacketConfig plant)
+	{
+		try
+		{
+			if (seedBank == null || !GodotObject.IsInstanceValid(seedBank) || plant == null
+				|| string.IsNullOrEmpty(plant.saveKey))
+			{
+				return false;
+			}
+			foreach (TowerDefenseInGamePacketShow c in seedBank.packetList)
+			{
+				if (c == null || !GodotObject.IsInstanceValid(c) || c.originalSaveKey != MyKey)
+				{
+					continue;
+				}
+				TowerDefensePacketConfig t = TargetOfCard(c);
+				if (t != null && GodotObject.IsInstanceValid(t) && t.saveKey == plant.saveKey)
+				{
+					return true;
+				}
+			}
+		}
+		catch { }
+		return false;
+	}
+
+	/// <summary>卡池那张保持"还能点"（`alive` 决定 `Pressed()` 的守卫；`select` 决定选中框）。</summary>
+	private static void KeepPoolCardClickable(TowerDefenseInGamePacketShow card)
+	{
+		try
+		{
+			if (!card.alive)
+			{
+				card.alive = true;
+			}
+			card.select = true;
+		}
+		catch { }
+	}
+	/// <summary>
+	/// 每帧维护卡池那张模仿者卡的按压语义（幂等）：
+	///   · 开关开 ⇒ 摘掉游戏的 `PacketChoose`，只留本 Mod 的 `OnMimicPoolPressed`；
+	///   · 开关关 ⇒ 摘掉本 Mod 的，把 `PacketChoose` 原样挂回（还原原生"再点=取消"）。
+	///
+	/// 为什么用"每帧 `-=` / `+=`"而不是"打过标记就不再重挂"：卡池卡是**虚拟化复用**的，
+	/// `RefreshVirtualizedPacketBindings()` 里 `UnbindVirtualizedPacket()` + `ResetForPool()`
+	/// 会把 `OnPressed` **整个清空**（`ClearEventHandlers()` 里 `OnPressed = null`）——
+	/// 标记会活着但订阅已经没了。而 `Delegate.Remove` 只移除**最后一次**匹配项、没订阅时是
+	/// no-op ⇒ `-=` 后 `+=` 恒等于"恰好一份、且在队尾（跑在游戏处理器之后）"，零反射、零状态。
+	/// </summary>
+	private void MaintainMimicPoolPress(TowerDefenseInGamePacketShow card)
+	{
+		try
+		{
+			TowerDefenseBattleFeaturePacketBank bank = GetChooseBankFeature();
+			if (bank == null || !GodotObject.IsInstanceValid(bank))
+			{
+				return;
+			}
+			if (_allowMultipleCopy)
+			{
+				card.OnPressed -= bank.PacketChoose;      // 换成"再加一张"
+				card.OnPressed -= OnMimicPoolPressed;
+				card.OnPressed += OnMimicPoolPressed;
+			}
+			else
+			{
+				card.OnPressed -= OnMimicPoolPressed;     // 完整还原原生行为
+				card.OnPressed -= bank.PacketChoose;
+				card.OnPressed += bank.PacketChoose;
+			}
+		}
+		catch { }
+	}
+
+	/// <summary>选卡界面那个卡池 feature（`GetPacketBankFeature()` 是**实例**方法，必须先拿 Instance）。</summary>
+	private static TowerDefenseBattleFeaturePacketBank GetChooseBankFeature()
+	{
+		try
+		{
+			TowerDefenseManager mgr = TowerDefenseManager.Instance;
+			if (mgr == null || !GodotObject.IsInstanceValid(mgr))
+			{
+				return null;
+			}
+			TowerDefenseBattleFeaturePacketBank bank = mgr.GetPacketBankFeature();
+			return (bank != null && GodotObject.IsInstanceValid(bank)) ? bank : null;
+		}
+		catch
+		{
+			return null;
+		}
+	}
+
+	/// <summary>卡槽里"身份 = 本 Mod 模仿者"的卡有几张（身份口径与游戏一致：`originalSaveKey`）。</summary>
+	private static int CountMimics(TowerDefenseInGameSeedBank seedBank)
+	{
+		int n = 0;
+		try
+		{
+			if (seedBank == null || !GodotObject.IsInstanceValid(seedBank) || seedBank.packetList == null)
+			{
+				return 0;
+			}
+			foreach (TowerDefenseInGamePacketShow c in seedBank.packetList)
+			{
+				if (c != null && GodotObject.IsInstanceValid(c) && c.originalSaveKey == MyKey)
+				{
+					n++;
+				}
+			}
+		}
+		catch { }
+		return n;
+	}
+
+	/// <summary>
+	/// 往卡槽追加一张模仿者卡 —— 走游戏自己的 `TowerDefenseInGamePacketBank.CreateAnime()`，
+	/// 也就是原生 `PacketChoose` 追加时用的那条路（源码实证）：
+	/// `CreateAnime(config, pos)` 内部 = 深拷贝 config → `seedBank.AddPacket(dup, IsGameRunning())`
+	/// → 飞入动画 → 动画结束后把卡显示出来。
+	/// 新卡由 `AddPacket` 自己挂上 `OnPressed += DeletePacket`（`isStart == false`）
+	/// ⇒ 卡槽里点它 = 移除，和原生一致。
+	/// </summary>
+	private bool AddMimicPacket(TowerDefenseInGamePacketShow poolCard)
+	{
+		try
+		{
+			TowerDefenseBattleFeaturePacketBank bank = GetChooseBankFeature();
+			if (bank == null || !GodotObject.IsInstanceValid(bank))
+			{
+				return false;
+			}
+			TowerDefenseInGamePacketBank gui = bank.packetBank;
+			if (gui == null || !GodotObject.IsInstanceValid(gui))
+			{
+				return false;
+			}
+			gui.CreateAnime(poolCard.config, gui.GetCameraPos() + poolCard.GlobalPosition);
+			return true;
+		}
+		catch (Exception ex)
+		{
+			if (_diag < 47)
+			{
+				_diag = 47;
+				Log("追加模仿者卡异常（本条只报一次）：" + ex.Message);
+			}
+			return false;
+		}
+	}
+
 
 	// ================================================================ 卡池归置
 

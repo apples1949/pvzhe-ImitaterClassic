@@ -249,6 +249,38 @@ metadata/_custom_type_script = "{S_PACKET}"
 """
 
 
+def _merged_manifest():
+    """★ 在生成的清单上**保留**外部维护的字段。
+
+    这个脚本每次构建都会用 manifest() 整体重写 mod.json，会把
+    author / runtimeApiVersion / settings / playInstructions / description
+    这些由维护流程（P1 元信息统一）写入的内容清掉。
+    这里在写盘前把它们从现有文件里读回来覆盖上去，避免"构建即回退"。
+
+    ⚠️ 2026-10-12 血训：这里原来是 `except Exception: pass` —— 手改 mod.json 时
+    不小心写进一个未转义的 `"` 让 JSON 非法，构建**静默**按 manifest() 生成，
+    于是 settings / playInstructions / author / runtimeApiVersion 全被清空
+    （配置页直接变成一个空页，而且构建 RC=0 看不出来）。
+    ⇒ 现在解析失败**直接抛错终止构建**，绝不静默丢弃外部维护字段。
+    """
+    m = manifest()
+    p = os.path.join(BASE, "mod.json")
+    if os.path.isfile(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                old = json.load(f)
+        except Exception as e:
+            raise RuntimeError(
+                "现有 mod.json 解析失败（%r）：%s\n"
+                "→ 拒绝继续生成清单（否则会把 settings / playInstructions / author / "
+                "runtimeApiVersion 等外部维护字段静默清空）。请修好 mod.json 的 JSON 语法后重跑。" % (e, p)
+            )
+        for k in ("author", "runtimeApiVersion", "settings", "playInstructions", "description"):
+            if k in old:
+                m[k] = old[k]
+    return m
+
+
 def manifest():
     resources = sorted([
         CARD_REL,
@@ -258,12 +290,13 @@ def manifest():
         f"{PKG}/Scene/{SCENE_FILE}",
         f"{PKG}/Sprite/{SPRITE_FILE}",
         "Runtime/ModAssembly.dll",
+        "Resources/SponsorQR.png",
     ], key=lambda p: p.lower())
     return {
         "schemaVersion": 2,
         "id": MOD_ID,
         "name": MOD_NAME,
-        "version": "1.5.0",
+        "version": "1.7.1",
         "author": "本地",
         "description": (
             f"新增植物「{PN}」（彩卡）：PvZ 1 代原版模仿者行为 —— 选中该卡后自动复制你"
@@ -378,7 +411,7 @@ def package():
                 fp = os.path.join(root, fn)
                 arc = os.path.relpath(fp, BASE).replace("\\", "/")
                 z.write(fp, arc)
-        z.write(dll, "Runtime/ModAssembly.dll")
+        z.write(dll, "Runtime/ModAssembly.dll")   # SponsorQR.png 已由上面 os.walk(Resources) 打进包
     with zipfile.ZipFile(DIST) as z:
         first = z.namelist()[0]          # 写入顺序（mod.json 是第一个写的）
         nl = sorted(z.namelist())
@@ -473,7 +506,7 @@ def main():
         log("[gen] %s %s" % ("updated" if ch else "same   ", os.path.relpath(p, BASE)))
 
     w(os.path.join(BASE, "mod.json"),
-      json.dumps(manifest(), ensure_ascii=False, indent=2) + "\n")
+      json.dumps(_merged_manifest(), ensure_ascii=False, indent=2) + "\n")
     log("[gen] mod.json")
 
     # 2) 编译
@@ -501,5 +534,9 @@ if __name__ == "__main__":
     txt = "\n".join(out)
     with open(os.path.join(BASE, "_imitater_build.log"), "w", encoding="utf-8") as f:
         f.write(txt)
+    try:
+        sys.stdout.reconfigure(encoding=sys.stdout.encoding or "utf-8", errors="replace")
+    except Exception:
+        pass
     print(txt)
     sys.exit(rc)
